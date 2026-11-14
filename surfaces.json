@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "tools": [
+    {
+      "id": "pdfsign",
+      "modes": [
+        {
+          "id": "sign",
+          "label": "Sign PDF",
+          "fields": ["input_file", "output_file"],
+          "action": "sign"
+        }
+      ],
+      "fields": [
+        {
+          "id": "input_file",
+          "kind": "files",
+          "label": "PDF Document",
+          "required": true
+        },
+        {
+          "id": "output_file",
+          "kind": "text",
+          "label": "Output Signed PDF Path",
+          "required": true
+        }
+      ],
+      "actions": [
+        {
+          "id": "sign",
+          "label": "Sign PDF",
+          "inputs": ["input_file", "output_file"]
+        }
+      ],
+      "settings": [
+        {
+          "id": "default_output_dir",
+          "kind": "directory",
+          "label": "Default Output Folder",
+          "description": "Destination folder for signed PDF files.",
+          "default": "~/Downloads",
+          "required": true
+        }
+      ]
+    }
+  ]
+}

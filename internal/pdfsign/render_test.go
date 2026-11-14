@@ -3,7 +3,9 @@ package pdfsign
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -107,6 +109,11 @@ func TestRenderer(t *testing.T) {
 }
 
 func TestRendererOrientationAndHiDPI(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		if _, err := exec.LookPath("pdftoppm"); err != nil {
+			t.Skip("skipping content orientation check: pdftoppm not installed and pure-Go fallback renders a blank placeholder")
+		}
+	}
 	tmpDir := t.TempDir()
 	pdfPath := filepath.Join(tmpDir, "top_black.pdf")
 	topBlackPDF := `%PDF-1.4

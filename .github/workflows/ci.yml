@@ -14,6 +14,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Install poppler-utils for PDF rasterization tests
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
       - name: Run tests
         run: go test -race ./...
       - name: Build sidecar

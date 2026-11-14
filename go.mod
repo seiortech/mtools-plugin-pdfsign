@@ -6,8 +6,8 @@ require (
 	github.com/ebitengine/purego v0.11.1
 	github.com/egoist/mygo v0.9.0
 	github.com/pdfcpu/pdfcpu v0.16.4
-	github.com/seiortech/mtools-sdk v0.1.0
-	github.com/seiortech/mtools-sdk/ui v0.1.0
+	github.com/seiortech/mtools-sdk v0.1.1
+	github.com/seiortech/mtools-sdk/ui v0.1.1
 )
 
 require (
@@ -19,10 +19,6 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/image v0.47.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
-)
-
-replace (
-	github.com/seiortech/mtools-sdk => ../mtools-sdk
-	github.com/seiortech/mtools-sdk/ui => ../mtools-sdk/ui
 )

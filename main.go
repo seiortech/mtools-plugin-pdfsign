@@ -82,9 +82,13 @@ type pdfSignServer struct {
 	mu       sync.Mutex
 	rev      uint64
 	dataDir  string
+	appSettingsFile string
+	sharedPDFiumDir string
+	lastSettings    map[string]string
 	vault    *pdfsign.SignatureVault
 	history  *pdfsign.HistoryStore
 	renderer pdfsign.PageRenderer
+	previewEngineErr error
 	catalog  *i18n.Catalog
 	lang     i18n.Lang
 	sess     *pluginapi.UISession
@@ -314,10 +318,45 @@ func (s *pdfSignServer) Open(ctx context.Context, p pluginapi.UIOpenParams, sess
 		dataDir = filepath.Join(os.TempDir(), "mtools-pdfsign-data")
 	}
 	s.dataDir = dataDir
+	s.appSettingsFile = p.Settings["app_settings_file"]
+	s.sharedPDFiumDir = p.Settings["shared_pdfium_dir"]
+	s.lastSettings = p.Settings
+	s.configureRendererLocked(p.Settings)
 	s.vault = pdfsign.NewSignatureVault(dataDir)
 	s.history = pdfsign.NewHistoryStore(dataDir)
 	s.syncVaultAssetsLocked(sess)
 	return s.buildTreeLocked(), nil
+}
+
+func (s *pdfSignServer) configureRendererLocked(settings map[string]string) {
+	cr, ok := s.renderer.(pdfsign.ConfigurableRenderer)
+	if !ok {
+		return
+	}
+	wasmPath := ""
+	if settings != nil {
+		wasmPath = strings.TrimSpace(settings["pdfium_wasm_path"])
+	}
+	if wasmPath == "" && s.appSettingsFile != "" {
+		if raw, err := os.ReadFile(s.appSettingsFile); err == nil {
+			var parsed map[string]any
+			if json.Unmarshal(raw, &parsed) == nil {
+				if v, ok := parsed["pdfium_wasm_path"].(string); ok {
+					wasmPath = strings.TrimSpace(v)
+				}
+			}
+		}
+	}
+	if wasmPath == "" && s.sharedPDFiumDir != "" {
+		candidate := filepath.Join(s.sharedPDFiumDir, "pdfium.wasm")
+		if _, err := os.Stat(candidate); err == nil {
+			wasmPath = candidate
+		}
+	}
+	cr.Configure(pdfsign.RendererConfig{
+		WASMPath: wasmPath,
+		CacheDir: filepath.Join(s.dataDir, "pdfium-cache"),
+	})
 }
 
 func (s *pdfSignServer) Close(ctx context.Context) error {
@@ -335,6 +374,9 @@ func (s *pdfSignServer) Close(ctx context.Context) error {
 	if s.exportCancel != nil {
 		s.exportCancel()
 		s.exportCancel = nil
+	}
+	if cr, ok := s.renderer.(pdfsign.ConfigurableRenderer); ok {
+		_ = cr.Close()
 	}
 	return nil
 }
@@ -527,6 +569,15 @@ func (s *pdfSignServer) handleClickLocked(nodeID string, sess *pluginapi.UISessi
 	}
 
 	switch nodeID {
+	case "retry_pdfium":
+		s.previewEngineErr = nil
+		s.configureRendererLocked(nil)
+		if s.pdfPath != "" {
+			s.pageCache.ClearForPath(s.pdfPath)
+			s.clearPageAssetsLocked(sess)
+			s.triggerVisiblePageRendersLocked(sess)
+		}
+		return true
 	case "viewport":
 		if s.activeID != "" {
 			s.activeID = ""
@@ -876,10 +927,24 @@ func (s *pdfSignServer) requestPageRenderLocked(pageNum int, scale float64, sess
 		img, err := renderer.RenderPage(context.Background(), pdfPath, pageNum, scale)
 		s.mu.Lock()
 		delete(s.inFlightRenders, key)
-		if err != nil || img == nil || s.docGen != docGen || s.pdfPath != pdfPath {
+		if err != nil {
+			if (errors.Is(err, pdfsign.ErrPDFiumMissing) || errors.Is(err, pdfsign.ErrPDFiumInvalid)) && s.docGen == docGen && s.pdfPath == pdfPath {
+				s.previewEngineErr = err
+				tree := s.buildTreeLocked()
+				s.mu.Unlock()
+				if sess != nil {
+					_ = sess.Render(tree)
+				}
+				return
+			}
 			s.mu.Unlock()
 			return
 		}
+		if img == nil || s.docGen != docGen || s.pdfPath != pdfPath {
+			s.mu.Unlock()
+			return
+		}
+		s.previewEngineErr = nil
 		s.pageCache.Put(pdfPath, pageNum, scale, img)
 		s.storeRenderedPageAssetLocked(key, img, sess)
 		tree := s.buildTreeLocked()

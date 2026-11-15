@@ -3,6 +3,7 @@ package pdfsign
 import (
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"math"
@@ -163,5 +164,23 @@ func DefaultRenderer() PageRenderer {
 	return defaultPlatformRenderer()
 }
 
+// RendererConfig supplies runtime configuration for external preview engines (e.g. pdfium.wasm).
+type RendererConfig struct {
+	WASMPath string
+	CacheDir string
+}
+
+// ConfigurableRenderer is optionally implemented by renderers that accept runtime configuration and own resources.
+type ConfigurableRenderer interface {
+	Configure(cfg RendererConfig)
+	Close() error
+}
+
 // ErrPageOutOfRange is returned when a requested page is not in the PDF.
 var ErrPageOutOfRange = fmt.Errorf("pdf page number out of range")
+
+// ErrPDFiumMissing indicates that pdfium.wasm is not configured or not found on disk.
+var ErrPDFiumMissing = errors.New("pdfium.wasm is not configured or missing")
+
+// ErrPDFiumInvalid indicates that the configured pdfium.wasm failed validation or failed to initialize.
+var ErrPDFiumInvalid = errors.New("pdfium.wasm is invalid or failed to initialize")

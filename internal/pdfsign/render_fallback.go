@@ -60,10 +60,12 @@ func (r *FallbackRenderer) RenderPage(ctx context.Context, pdfPath string, pageN
 			"-l", strconv.Itoa(pageNum),
 			"-r", strconv.Itoa(dpi),
 			pdfPath,
+			"-",
 		)
+		setCmdHideWindow(cmd)
 		var out bytes.Buffer
 		cmd.Stdout = &out
-		// pdftoppm writes to stdout when no output prefix is provided
+		// pdftoppm writes to stdout when "-" output prefix is provided
 		if err := cmd.Run(); err == nil {
 			if img, err := png.Decode(&out); err == nil {
 				return img, nil

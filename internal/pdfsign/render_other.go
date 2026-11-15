@@ -3,5 +3,5 @@
 package pdfsign
 
 func defaultPlatformRenderer() PageRenderer {
-	return &FallbackRenderer{}
+	return NewPDFiumRenderer()
 }

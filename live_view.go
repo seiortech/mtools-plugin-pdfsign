@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -547,28 +548,95 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 		})
 	}
 
-	stackChildren := []pluginapi.UINode{
-		{
-			ID:   "viewport",
-			Kind: pluginapi.UINodeScroll,
+	viewportNode := pluginapi.UINode{
+		ID:   "viewport",
+		Kind: pluginapi.UINodeScroll,
+		Props: mustProps(pluginapi.UIContainerProps{
+			Fill:        true,
+			Grow:        true,
+			Padding:     24,
+			Gap:         24,
+			Align:       "center",
+			Justify:     "center",
+			Surface:     "ground",
+			ScrollBoth:  true,
+			TrackScroll: true,
+			Clickable:   true,
+			ScrollTarget: &pluginapi.UIScrollTarget{
+				Y:      s.targetScrollY,
+				Seq:    s.scrollSeq,
+				Smooth: s.scrollSeq > 1,
+			},
+		}),
+		Children: pageNodes,
+	}
+
+	var stackChildren []pluginapi.UINode
+	if s.previewEngineErr != nil {
+		titleKey := "pdfsign.pdfium_missing_title"
+		if errors.Is(s.previewEngineErr, pdfsign.ErrPDFiumInvalid) {
+			titleKey = "pdfsign.pdfium_invalid_title"
+		}
+		banner := pluginapi.UINode{
+			ID:   "pdfium_engine_banner",
+			Kind: pluginapi.UINodeRow,
 			Props: mustProps(pluginapi.UIContainerProps{
-				Fill:        true,
-				Padding:     24,
-				Gap:         24,
-				Align:       "center",
-				Justify:     "center",
-				Surface:     "ground",
-				ScrollBoth:  true,
-				TrackScroll: true,
-				Clickable:   true,
-				ScrollTarget: &pluginapi.UIScrollTarget{
-					Y:      s.targetScrollY,
-					Seq:    s.scrollSeq,
-					Smooth: s.scrollSeq > 1,
-				},
+				Surface: "sunken",
+				Padding: 12,
+				Gap:     12,
+				Align:   "center",
 			}),
-			Children: pageNodes,
-		},
+			Children: []pluginapi.UINode{
+				{
+					ID:   "pdfium_engine_msg_col",
+					Kind: pluginapi.UINodeColumn,
+					Props: mustProps(pluginapi.UIContainerProps{
+						Grow: true,
+						Gap:  2,
+					}),
+					Children: []pluginapi.UINode{
+						{
+							ID:   "pdfium_engine_title",
+							Kind: pluginapi.UINodeText,
+							Props: mustProps(pluginapi.UITextProps{
+								Text:    s.T(titleKey),
+								Variant: "warning",
+							}),
+						},
+						{
+							ID:   "pdfium_engine_desc",
+							Kind: pluginapi.UINodeText,
+							Props: mustProps(pluginapi.UITextProps{
+								Text:    s.T("pdfsign.pdfium_missing_desc"),
+								Variant: "muted",
+							}),
+						},
+					},
+				},
+				{
+					ID:   "retry_pdfium",
+					Kind: pluginapi.UINodeButton,
+					Props: mustProps(pluginapi.UIButtonProps{
+						Label:   s.T("pdfsign.btn_reload_preview"),
+						Variant: "secondary",
+						Icon:    "refresh-cw",
+					}),
+				},
+			},
+		}
+		stackChildren = []pluginapi.UINode{
+			{
+				ID:   "viewport_with_banner",
+				Kind: pluginapi.UINodeColumn,
+				Props: mustProps(pluginapi.UIContainerProps{
+					Fill: true,
+					Grow: true,
+				}),
+				Children: []pluginapi.UINode{banner, viewportNode},
+			},
+		}
+	} else {
+		stackChildren = []pluginapi.UINode{viewportNode}
 	}
 
 	return pluginapi.UINode{

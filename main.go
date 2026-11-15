@@ -69,6 +69,7 @@ type studioState struct {
 	threshold        float64
 	contrast         float64
 	photoInk         pdfsign.InkColorMode
+	photoCrisp       bool
 	photoResult      *image.NRGBA
 	photoSeq         int
 	photoPreviewRef  string
@@ -96,8 +97,9 @@ type pdfSignServer struct {
 	pageSizes      []pageSize
 	zoom           float64
 	fitZoom        float64
-	viewportW      float64
-	viewportH      float64
+	viewportW          float64
+	viewportH          float64
+	viewportFromScroll bool
 	scrollY        float64
 	targetScrollY  float64
 	scrollSeq      uint64
@@ -507,6 +509,14 @@ func (s *pdfSignServer) handleShortcutLocked(spec string) bool {
 			s.lockAspect = !s.lockAspect
 			return true
 		}
+	case "delete", "backspace":
+		if !s.studio.open && s.activeID != "" {
+			return s.deleteActiveLocked()
+		}
+	case "ctrl+d", "cmd+d":
+		if !s.studio.open && s.activeID != "" {
+			return s.duplicateActiveLocked(s.sess)
+		}
 	}
 	return false
 }
@@ -557,7 +567,9 @@ func (s *pdfSignServer) handleClickLocked(nodeID string, sess *pluginapi.UISessi
 		s.exportDone = false
 		s.exportErr = ""
 		return true
-	case "sel_lock", "insp_lock":
+	case "sel_lock":
+		return s.toggleActivePlacementLockLocked()
+	case "insp_lock":
 		s.lockAspect = !s.lockAspect
 		return true
 	case "sel_rot_left":
@@ -576,6 +588,8 @@ func (s *pdfSignServer) handleClickLocked(nodeID string, sess *pluginapi.UISessi
 		return s.recolorActiveLocked(pdfsign.InkBlack, sess)
 	case "insp_ink_blue":
 		return s.recolorActiveLocked(pdfsign.InkBlue, sess)
+	case "insp_crisp":
+		return s.toggleActiveCrispLocked(sess)
 	}
 
 	if strings.HasPrefix(nodeID, "page_") {
@@ -677,7 +691,10 @@ func (s *pdfSignServer) computeFitZoomLocked() {
 	if vpW <= 0 {
 		vpW = 900
 	}
-	availW := vpW - railW - 64
+	availW := vpW - 64
+	if !s.viewportFromScroll {
+		availW -= railW
+	}
 	if availW < 360 {
 		availW = 540
 	}
@@ -767,6 +784,7 @@ func (s *pdfSignServer) handleViewportScrollLocked(val string, sess *pluginapi.U
 	}
 	if e3 == nil && cw > 0 {
 		s.viewportW = cw
+		s.viewportFromScroll = true
 	}
 	if e4 == nil && ch > 0 {
 		s.viewportH = ch
@@ -1054,6 +1072,9 @@ func (s *pdfSignServer) refreshPlacementAssetLocked(pl pdfsign.PlacedSignature, 
 		return
 	}
 	processed := pdfsign.RecolorSignature(pl.Image, pl.InkMode)
+	if pl.Crisp {
+		processed = pdfsign.EnhanceSignatureInk(processed)
+	}
 	rendered := pdfsign.RenderPlacementImage(processed, pdfsign.PlacementRenderOptions{
 		Crop:        pl.Crop,
 		RotationDeg: pl.Rotation,
@@ -1108,9 +1129,33 @@ func (s *pdfSignServer) resizePlacementLocked(id string, canvasX, canvasY, canva
 	return false
 }
 
+func (s *pdfSignServer) toggleActiveCrispLocked(sess *pluginapi.UISession) bool {
+	for i := range s.placements {
+		if s.placements[i].ID == s.activeID {
+			s.placements[i].Crisp = !s.placements[i].Crisp
+			s.refreshPlacementAssetLocked(s.placements[i], sess)
+			return true
+		}
+	}
+	return false
+}
+
+func (s *pdfSignServer) toggleActivePlacementLockLocked() bool {
+	for i := range s.placements {
+		if s.placements[i].ID == s.activeID {
+			s.placements[i].Locked = !s.placements[i].Locked
+			return true
+		}
+	}
+	return false
+}
+
 func (s *pdfSignServer) rotateActiveLocked(deltaDeg float64, sess *pluginapi.UISession) bool {
 	for i := range s.placements {
 		if s.placements[i].ID == s.activeID {
+			if s.placements[i].Locked {
+				return false
+			}
 			s.placements[i].Rotation = math.Mod(s.placements[i].Rotation+deltaDeg+360, 360)
 			if math.Abs(math.Mod(math.Abs(deltaDeg), 180)-90) < 1 {
 				dims := s.pageDimsAtLocked(s.placements[i].Page)
@@ -1145,6 +1190,7 @@ func (s *pdfSignServer) duplicateActiveLocked(sess *pluginapi.UISession) bool {
 			s.nextSigSeq++
 			clone := pl
 			clone.ID = fmt.Sprintf("sig_%d", s.nextSigSeq)
+			clone.Locked = false
 			clone.X = min(pl.X+16, max(dims.W-pl.Width, 0))
 			clone.Y = min(pl.Y+16, max(dims.H-pl.Height, 0))
 			s.placements = append(s.placements, clone)
@@ -1189,6 +1235,9 @@ func (s *pdfSignServer) deleteActiveLocked() bool {
 		return pl.ID == s.activeID
 	})
 	if idx < 0 {
+		return false
+	}
+	if s.placements[idx].Locked {
 		return false
 	}
 	removed := s.placements[idx]

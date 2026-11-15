@@ -70,6 +70,10 @@ func (s *pdfSignServer) handleStudioClickLocked(nodeID string, sess *pluginapi.U
 		s.studio.photoInk = pdfsign.InkBlue
 		s.recomputePhotoPreviewLocked(sess)
 		return true
+	case "studio_photo_crisp":
+		s.studio.photoCrisp = !s.studio.photoCrisp
+		s.recomputePhotoPreviewLocked(sess)
+		return true
 	case "studio_save_vault":
 		return s.commitStudioLocked(true, false, sess)
 	case "studio_place_sig":
@@ -149,10 +153,11 @@ func (s *pdfSignServer) recomputePhotoPreviewLocked(sess *pluginapi.UISession) {
 		src = s.studio.rawPhoto
 	}
 	opts := pdfsign.PhotoProcessOptions{
-		Threshold: s.studio.threshold,
-		Contrast:  s.studio.contrast,
-		InkMode:   s.studio.photoInk,
-		Crop:      pdfsign.DefaultNormalizedRect(),
+		Threshold:  s.studio.threshold,
+		Contrast:   s.studio.contrast,
+		InkMode:    s.studio.photoInk,
+		Crop:       pdfsign.DefaultNormalizedRect(),
+		EnhanceInk: s.studio.photoCrisp,
 	}
 	res := pdfsign.AutoTrimAlphaBounds(pdfsign.RemoveBackground(src, opts), 8)
 	s.studio.photoResult = res
@@ -184,10 +189,11 @@ func (s *pdfSignServer) buildFinalStudioImageLocked() (*image.NRGBA, string) {
 			return nil, ""
 		}
 		opts := pdfsign.PhotoProcessOptions{
-			Threshold: s.studio.threshold,
-			Contrast:  s.studio.contrast,
-			InkMode:   s.studio.photoInk,
-			Crop:      pdfsign.DefaultNormalizedRect(),
+			Threshold:  s.studio.threshold,
+			Contrast:   s.studio.contrast,
+			InkMode:    s.studio.photoInk,
+			Crop:       pdfsign.DefaultNormalizedRect(),
+			EnhanceInk: s.studio.photoCrisp,
 		}
 		trimmed := pdfsign.AutoTrimAlphaBounds(pdfsign.RemoveBackground(s.studio.rawPhoto, opts), 8)
 		return trimmed, "photo"
@@ -596,6 +602,17 @@ func (s *pdfSignServer) buildStudioPhotoBodyLocked() pluginapi.UINode {
 							Label:    s.T("pdfsign.ink_blue"),
 							Variant:  "secondary",
 							Selected: s.studio.photoInk == pdfsign.InkBlue,
+							Disabled: s.studio.rawPhoto == nil,
+							Height:   28,
+						}),
+					},
+					{
+						ID:   "studio_photo_crisp",
+						Kind: pluginapi.UINodeButton,
+						Props: mustProps(pluginapi.UIButtonProps{
+							Label:    s.T("pdfsign.crisp_ink"),
+							Variant:  "secondary",
+							Selected: s.studio.photoCrisp,
 							Disabled: s.studio.rawPhoto == nil,
 							Height:   28,
 						}),

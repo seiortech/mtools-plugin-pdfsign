@@ -39,6 +39,7 @@ type PlacedSignature struct {
 	InkMode   InkColorMode    // Ink recoloring (InkOriginal, InkBlack, InkBlue, InkRed)
 	Image     image.Image     // Source raster image
 	Locked    bool            // If true, placement cannot be moved, resized, rotated, or deleted
+	Crisp     bool            // If true, applies EnhanceSignatureInk for sharper edges and smooth lines
 
 	// Cached rendered image & bitmap
 	cachedRot   float64
@@ -137,6 +138,9 @@ func SignPDF(ctx context.Context, req SignRequest, progress func(done float64, m
 		crop := sig.Crop
 		if crop.W <= 0 || crop.H <= 0 {
 			crop = DefaultNormalizedRect()
+		}
+		if sig.Crisp {
+			procImg = EnhanceSignatureInk(procImg)
 		}
 
 		compImg := RenderPlacementImage(procImg, PlacementRenderOptions{

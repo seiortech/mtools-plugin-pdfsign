@@ -246,3 +246,161 @@ func TestPDFSignLiveUIFlow(t *testing.T) {
 		t.Fatalf("expected history.json created on sign export: %v", err)
 	}
 }
+
+func findNodeByID(root pluginapi.UINode, id string) (pluginapi.UINode, bool) {
+	if root.ID == id {
+		return root, true
+	}
+	for _, ch := range root.Children {
+		if found, ok := findNodeByID(ch, id); ok {
+			return found, true
+		}
+	}
+	return pluginapi.UINode{}, false
+}
+
+func TestPDFSignCanvasToolbarShortcutsAndFitZoom(t *testing.T) {
+	tmp := t.TempDir()
+	srv := newPDFSignServer()
+	dataDir := filepath.Join(tmp, "data")
+	srv.dataDir = dataDir
+	srv.vault = pdfsign.NewSignatureVault(dataDir)
+	srv.history = pdfsign.NewHistoryStore(dataDir)
+
+	pdfFile := filepath.Join(tmp, "sample.pdf")
+	if err := os.WriteFile(pdfFile, []byte(testMinimalPDF), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	srv.loadPDFLocked(context.Background(), pdfFile, nil)
+	srv.zoom = 1.0
+
+	sigImg := image.NewNRGBA(image.Rect(0, 0, 120, 40))
+	sigImg.Set(10, 10, color.NRGBA{R: 10, G: 10, B: 10, A: 255})
+	srv.placeSignatureAtLocked(sigImg, "sig_src", 1, 100, 120, nil)
+	if srv.activeID == "" || len(srv.placements) != 1 {
+		t.Fatalf("expected 1 active placement, got %d (active=%q)", len(srv.placements), srv.activeID)
+	}
+	origID := srv.activeID
+
+	// 1. On-canvas toolbar renders inside page_1 above placement (py=120 -> top < 120).
+	tree := srv.buildTreeLocked()
+	if err := tree.Validate(); err != nil {
+		t.Fatalf("tree invalid: %v", err)
+	}
+	page1, ok := findNodeByID(tree.Root, "page_1")
+	if !ok {
+		t.Fatal("expected page_1 node")
+	}
+	bar, ok := findNodeByID(page1, "sel_bar_"+origID)
+	if !ok {
+		t.Fatalf("expected sel_bar_%s inside page_1", origID)
+	}
+	barProps, err := pluginapi.DecodeProps[pluginapi.UIContainerProps](bar)
+	if err != nil {
+		t.Fatalf("decode sel_bar props: %v", err)
+	}
+	if barProps.Top == nil || *barProps.Top >= 120 {
+		t.Fatalf("expected sel_bar Top < 120 above placement, got %v", barProps.Top)
+	}
+
+	// 2. When placement is near top edge (py=10), bar flips below placement (Top > 10+40).
+	srv.placements[0].Y = 10
+	tree = srv.buildTreeLocked()
+	bar, _ = findNodeByID(tree.Root, "sel_bar_"+origID)
+	barProps, _ = pluginapi.DecodeProps[pluginapi.UIContainerProps](bar)
+	if barProps.Top == nil || *barProps.Top < 50 {
+		t.Fatalf("expected sel_bar to flip below placement when py=10, got %v", barProps.Top)
+	}
+
+	// 3. Clicking sel_lock toggles per-placement Locked, disables Rotate/Delete, and blocks Delete shortcut.
+	if !srv.handleClickLocked("sel_lock", nil) {
+		t.Fatal("expected sel_lock click handled")
+	}
+	if !srv.placements[0].Locked {
+		t.Fatal("expected placement to be locked")
+	}
+	if srv.handleShortcutLocked("Delete") || srv.handleShortcutLocked("Backspace") {
+		t.Fatal("expected Delete/Backspace to be blocked when placement is locked")
+	}
+	if len(srv.placements) != 1 {
+		t.Fatalf("locked placement should not be deleted, count=%d", len(srv.placements))
+	}
+	tree = srv.buildTreeLocked()
+	rotLeft, _ := findNodeByID(tree.Root, "sel_rot_left")
+	rotProps, _ := pluginapi.DecodeProps[pluginapi.UIButtonProps](rotLeft)
+	delBtn, _ := findNodeByID(tree.Root, "sel_del")
+	delProps, _ := pluginapi.DecodeProps[pluginapi.UIButtonProps](delBtn)
+	if !rotProps.Disabled || !delProps.Disabled {
+		t.Fatalf("expected Rotate and Delete disabled when locked, got rot=%v del=%v", rotProps.Disabled, delProps.Disabled)
+	}
+	placedNode, _ := findNodeByID(tree.Root, "placed_"+origID)
+	placedProps, _ := pluginapi.DecodeProps[pluginapi.UIDraggableProps](placedNode)
+	if !placedProps.ShowLockBadge {
+		t.Fatal("expected ShowLockBadge true on locked placement")
+	}
+
+	// 4. Ctrl+D duplicates active placement and unlocks the clone.
+	if !srv.handleShortcutLocked("Ctrl+D") {
+		t.Fatal("expected Ctrl+D handled")
+	}
+	if len(srv.placements) != 2 || srv.activeID == origID {
+		t.Fatalf("expected 2 placements with new activeID, count=%d active=%q", len(srv.placements), srv.activeID)
+	}
+	if srv.placements[1].Locked {
+		t.Fatal("expected duplicated placement to start unlocked")
+	}
+
+	// 5. Backspace deletes unlocked active placement unless Signature Studio modal is open.
+	srv.studio.open = true
+	if srv.handleShortcutLocked("Backspace") {
+		t.Fatal("expected Backspace ignored while Studio modal is open")
+	}
+	srv.studio.open = false
+	if !srv.handleShortcutLocked("Backspace") {
+		t.Fatal("expected Backspace to delete unlocked active placement")
+	}
+	if len(srv.placements) != 1 || srv.activeID != "" {
+		t.Fatalf("expected 1 placement remaining and activeID cleared, count=%d active=%q", len(srv.placements), srv.activeID)
+	}
+
+	// 6. Scroll viewport bounds do not double-subtract railWidth in computeFitZoomLocked.
+	srv.pageSizes = []pageSize{{W: 800, H: 1000}}
+	srv.viewportFromScroll = false
+	srv.viewportW = 1000
+	srv.computeFitZoomLocked()
+	fitInitial := srv.fitZoom
+
+	srv.handleViewportScrollLocked("0,0,1000,800", nil)
+	if !srv.viewportFromScroll {
+		t.Fatal("expected viewportFromScroll set after scroll bounds event")
+	}
+	srv.computeFitZoomLocked()
+	if srv.fitZoom <= fitInitial {
+		t.Fatalf("expected fitZoom from scroll bounds (%v) > fitZoom before scroll bounds (%v) since railW is not double-subtracted", srv.fitZoom, fitInitial)
+	}
+
+	// 7. Optional Crisp Ink toggles in both Photo Studio and Right Inspector.
+	srv.studio.open = true
+	srv.studio.mode = studioModePhoto
+	srv.studio.rawPhoto = sigImg
+	if !srv.handleStudioClickLocked("studio_photo_crisp", nil) || !srv.studio.photoCrisp {
+		t.Fatal("expected studio_photo_crisp to toggle photoCrisp on")
+	}
+	srv.studio.open = false
+	srv.activeID = srv.placements[0].ID
+	if !srv.handleClickLocked("insp_crisp", nil) || !srv.placements[0].Crisp {
+		t.Fatal("expected insp_crisp to toggle placement Crisp on")
+	}
+	tree = srv.buildTreeLocked()
+	crispBtn, ok := findNodeByID(tree.Root, "insp_crisp")
+	if !ok {
+		t.Fatal("expected insp_crisp button in active inspector")
+	}
+	crispProps, _ := pluginapi.DecodeProps[pluginapi.UIButtonProps](crispBtn)
+	if !crispProps.Selected {
+		t.Fatal("expected insp_crisp Selected=true when active placement Crisp is on")
+	}
+}

@@ -112,7 +112,7 @@ func (s *pdfSignServer) buildWorkbenchTreeLocked() pluginapi.UINode {
 		Props: mustProps(pluginapi.UIContainerProps{
 			Fill:      true,
 			Surface:   "ground",
-			Shortcuts: []string{"Escape", "L", "Cmd+L", "Ctrl+L"},
+			Shortcuts: []string{"Escape", "Delete", "Backspace", "L", "Cmd+L", "Ctrl+L", "Ctrl+D", "Cmd+D"},
 		}),
 		Children: rootChildren,
 	}
@@ -415,7 +415,9 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 
 		assetRef := s.pageAssetRefLocked(p)
 		canvasChildren := make([]pluginapi.UINode, 0, 4)
-		for _, pl := range s.placements {
+		var activePlaced *pdfsign.PlacedSignature
+		for i := range s.placements {
+			pl := s.placements[i]
 			if pl.Page != p {
 				continue
 			}
@@ -457,11 +459,19 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 					Handles:       "all",
 					KeepAspect:    s.lockAspect,
 					AspectRatio:   aspect,
-					ShowLockBadge: pl.ID == s.activeID && s.lockAspect,
+					ShowLockBadge: pl.Locked || (pl.ID == s.activeID && s.lockAspect),
 					Disabled:      pl.Locked,
 				}),
 				Children: dragChildren,
 			})
+			if pl.ID == s.activeID {
+				copyPl := pl
+				activePlaced = &copyPl
+			}
+		}
+
+		if activePlaced != nil {
+			canvasChildren = append(canvasChildren, s.buildCanvasPlacementBarLocked(*activePlaced, z, pw, ph))
 		}
 
 		// Bottom-right page tag overlay (matches HEAD:pdfsign/view.go renderPageInScrollStack)
@@ -546,6 +556,7 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 				Padding:     24,
 				Gap:         24,
 				Align:       "center",
+				Justify:     "center",
 				Surface:     "ground",
 				ScrollBoth:  true,
 				TrackScroll: true,
@@ -560,10 +571,6 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 		},
 	}
 
-	if s.activeID != "" {
-		stackChildren = append(stackChildren, s.buildFloatingToolbarLocked())
-	}
-
 	return pluginapi.UINode{
 		ID:   "viewport_stack",
 		Kind: pluginapi.UINodeStack,
@@ -575,27 +582,43 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 	}
 }
 
-func (s *pdfSignServer) buildFloatingToolbarLocked() pluginapi.UINode {
-	lockIcon := "unlock"
-	if s.lockAspect {
-		lockIcon = "lock"
+func (s *pdfSignServer) buildCanvasPlacementBarLocked(pl pdfsign.PlacedSignature, z float64, pw, ph int) pluginapi.UINode {
+	px := pl.X * z
+	py := pl.Y * z
+	h := float64(max(int(math.Round(pl.Height*z)), 16))
+	const barW = 224.0
+	const barH = 34.0
+	barTop := py - barH - 4
+	if barTop < 4 {
+		barTop = py + h + 6
 	}
-	bottomVal := 16.0
-	leftVal := 24.0
+	if barTop+barH > float64(ph)-4 {
+		barTop = max(4.0, float64(ph)-barH-4)
+	}
+	maxLeft := max(4.0, float64(pw)-barW-4)
+	barLeft := min(max(px, 4.0), maxLeft)
+
+	lockIcon := "unlock"
+	lockTip := s.T("pdfsign.lock_placement")
+	if pl.Locked {
+		lockIcon = "lock"
+		lockTip = s.T("pdfsign.unlock_placement")
+	}
+
 	return pluginapi.UINode{
-		ID:   "floating_toolbar",
+		ID:   "sel_bar_" + pl.ID,
 		Kind: pluginapi.UINodeRow,
 		Props: mustProps(pluginapi.UIContainerProps{
 			Absolute:    true,
-			Bottom:      &bottomVal,
-			Left:        &leftVal,
-			PaddingH:    10,
-			PaddingV:    6,
-			Gap:         6,
+			Left:        &barLeft,
+			Top:         &barTop,
+			PaddingH:    4,
+			PaddingV:    3,
+			Gap:         3,
 			Align:       "center",
 			Surface:     "paper",
-			BorderSize:  2,
-			Shadow:      [2]int{3, 3},
+			BorderSize:  1,
+			BorderToken: "ink",
 			NoFillWidth: true,
 		}),
 		Children: []pluginapi.UINode{
@@ -603,61 +626,68 @@ func (s *pdfSignServer) buildFloatingToolbarLocked() pluginapi.UINode {
 				ID:   "sel_lock",
 				Kind: pluginapi.UINodeButton,
 				Props: mustProps(pluginapi.UIButtonProps{
-					Label:    "Lock",
 					Icon:     lockIcon,
-					Selected: s.lockAspect,
+					IconOnly: true,
+					Selected: pl.Locked,
 					Variant:  "secondary",
-					Height:   30,
-					Tooltip:  "Lock Aspect Ratio (L)",
+					Width:    26,
+					Height:   26,
+					PaddingX: 4,
+					PaddingY: 4,
+					Tooltip:  lockTip,
 				}),
 			},
 			{
 				ID:   "sel_rot_left",
 				Kind: pluginapi.UINodeButton,
 				Props: mustProps(pluginapi.UIButtonProps{
-					Label:   s.T("pdfsign.rotate_left"),
-					Icon:    "rotate",
-					Variant: "secondary",
-					Height:  30,
+					Label:    s.T("pdfsign.rotate_left"),
+					Disabled: pl.Locked,
+					Variant:  "secondary",
+					Height:   26,
+					PaddingX: 6,
+					PaddingY: 4,
 				}),
 			},
 			{
 				ID:   "sel_rot_right",
 				Kind: pluginapi.UINodeButton,
 				Props: mustProps(pluginapi.UIButtonProps{
-					Label:   s.T("pdfsign.rotate_right"),
-					Icon:    "rotate",
-					Variant: "secondary",
-					Height:  30,
+					Label:    s.T("pdfsign.rotate_right"),
+					Disabled: pl.Locked,
+					Variant:  "secondary",
+					Height:   26,
+					PaddingX: 6,
+					PaddingY: 4,
 				}),
 			},
 			{
 				ID:   "sel_dup",
 				Kind: pluginapi.UINodeButton,
 				Props: mustProps(pluginapi.UIButtonProps{
-					Label:   s.T("pdfsign.btn_duplicate"),
-					Icon:    "copy",
-					Variant: "secondary",
-					Height:  30,
-				}),
-			},
-			{
-				ID:   "sel_all_pages",
-				Kind: pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{
-					Label:   s.T("pdfsign.btn_all_pages"),
-					Variant: "secondary",
-					Height:  30,
+					Icon:     "copy",
+					IconOnly: true,
+					Variant:  "secondary",
+					Width:    26,
+					Height:   26,
+					PaddingX: 4,
+					PaddingY: 4,
+					Tooltip:  s.T("pdfsign.btn_duplicate") + " (Ctrl+D)",
 				}),
 			},
 			{
 				ID:   "sel_del",
 				Kind: pluginapi.UINodeButton,
 				Props: mustProps(pluginapi.UIButtonProps{
-					Label:   s.T("pdfsign.delete"),
-					Icon:    "trash",
-					Variant: "danger",
-					Height:  30,
+					Icon:     "trash",
+					IconOnly: true,
+					Disabled: pl.Locked,
+					Variant:  "danger",
+					Width:    26,
+					Height:   26,
+					PaddingX: 4,
+					PaddingY: 4,
+					Tooltip:  s.T("pdfsign.delete") + " (Del)",
 				}),
 			},
 		},
@@ -1154,6 +1184,16 @@ func (s *pdfSignServer) buildActiveInspectorLocked() *pluginapi.UINode {
 							Label:    lockLabel,
 							Variant:  "secondary",
 							Selected: s.lockAspect,
+							Height:   28,
+						}),
+					},
+					{
+						ID:   "insp_crisp",
+						Kind: pluginapi.UINodeButton,
+						Props: mustProps(pluginapi.UIButtonProps{
+							Label:    s.T("pdfsign.crisp_ink"),
+							Variant:  "secondary",
+							Selected: active.Crisp,
 							Height:   28,
 						}),
 					},

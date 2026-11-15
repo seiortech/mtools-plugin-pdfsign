@@ -128,3 +128,25 @@ func TestRenderPlacementRotationAndOpacity(t *testing.T) {
 		t.Fatalf("expected alpha around 128 for 0.5 opacity, got %d", midPixel.A)
 	}
 }
+
+func TestEnhanceSignatureInk(t *testing.T) {
+	// Small 40x20 image with a blurry semi-transparent halo (A=35) and solid stroke core (A=190).
+	src := image.NewNRGBA(image.Rect(0, 0, 40, 20))
+	for x := 5; x < 35; x++ {
+		src.SetNRGBA(x, 8, color.NRGBA{R: 20, G: 20, B: 20, A: 35})
+		src.SetNRGBA(x, 9, color.NRGBA{R: 20, G: 20, B: 20, A: 190})
+		src.SetNRGBA(x, 10, color.NRGBA{R: 20, G: 20, B: 20, A: 190})
+		src.SetNRGBA(x, 11, color.NRGBA{R: 20, G: 20, B: 20, A: 35})
+	}
+
+	out := pdfsign.EnhanceSignatureInk(src)
+	if out.Bounds().Dx() != 80 || out.Bounds().Dy() != 40 {
+		t.Fatalf("expected 2x upscaled dimensions 80x40, got %dx%d", out.Bounds().Dx(), out.Bounds().Dy())
+	}
+	if halo := out.NRGBAAt(40, 15).A; halo != 0 {
+		t.Fatalf("expected outer blurry halo alpha=0, got %d", halo)
+	}
+	if core := out.NRGBAAt(40, 19).A; core < 230 {
+		t.Fatalf("expected core ink alpha solidified >=230, got %d", core)
+	}
+}

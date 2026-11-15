@@ -46,10 +46,11 @@ type Stroke struct {
 
 // PhotoProcessOptions configures paper background removal and recoloring.
 type PhotoProcessOptions struct {
-	Threshold float64        // 0.0 to 1.0; luminance above this threshold becomes transparent
-	Contrast  float64        // >= 1.0; enhances stroke contrast
-	InkMode   InkColorMode   // InkOriginal, InkBlack, InkBlue, InkRed
-	Crop      NormalizedRect // Crop window inside source image [0..1]
+	Threshold  float64        // 0.0 to 1.0; luminance above this threshold becomes transparent
+	Contrast   float64        // >= 1.0; enhances stroke contrast
+	InkMode    InkColorMode   // InkOriginal, InkBlack, InkBlue, InkRed
+	Crop       NormalizedRect // Crop window inside source image [0..1]
+	EnhanceInk bool           // If true, applies EnhanceSignatureInk after background removal
 }
 
 func DefaultPhotoProcessOptions() PhotoProcessOptions {
@@ -159,6 +160,9 @@ func RemoveBackground(src image.Image, opts PhotoProcessOptions) *image.NRGBA {
 		}
 	}
 
+	if opts.EnhanceInk {
+		return EnhanceSignatureInk(dst)
+	}
 	return dst
 }
 
@@ -420,18 +424,13 @@ func RenderPlacementImage(src image.Image, opts PlacementRenderOptions) *image.N
 
 	for dy := 0; dy < rotH; dy++ {
 		for dx := 0; dx < rotW; dx++ {
-			xRel := float64(dx) - dstCX
-			yRel := float64(dy) - dstCY
+			xRel := float64(dx) + 0.5 - dstCX
+			yRel := float64(dy) + 0.5 - dstCY
 
-			sx := xRel*invCos - yRel*invSin + srcCX
-			sy := xRel*invSin + yRel*invCos + srcCY
+			sx := xRel*invCos - yRel*invSin + srcCX - 0.5
+			sy := xRel*invSin + yRel*invCos + srcCY - 0.5
 
-			ix := int(math.Round(sx))
-			iy := int(math.Round(sy))
-
-			if ix >= 0 && ix < cropW && iy >= 0 && iy < cropH {
-				dst.SetNRGBA(dx, dy, cropped.NRGBAAt(ix, iy))
-			}
+			dst.SetNRGBA(dx, dy, sampleNRGBABilinear(cropped, sx, sy))
 		}
 	}
 
@@ -486,7 +485,7 @@ func EncodePNGToBytes(img image.Image) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// DownscaleToMaxDim returns a nearest-sampled image whose largest side is at most maxDim.
+// DownscaleToMaxDim returns a bilinear-sampled image whose largest side is at most maxDim.
 func DownscaleToMaxDim(src image.Image, maxDim int) image.Image {
 	if src == nil || maxDim <= 0 {
 		return src
@@ -496,18 +495,143 @@ func DownscaleToMaxDim(src image.Image, maxDim int) image.Image {
 	if w <= 0 || h <= 0 || (w <= maxDim && h <= maxDim) {
 		return src
 	}
+	nrgba := toNRGBA(src)
 	scale := float64(maxDim) / float64(max(w, h))
 	nw := max(int(math.Round(float64(w)*scale)), 1)
 	nh := max(int(math.Round(float64(h)*scale)), 1)
 	dst := image.NewNRGBA(image.Rect(0, 0, nw, nh))
 	for y := 0; y < nh; y++ {
-		sy := b.Min.Y + y*h/nh
+		sy := (float64(y)+0.5)*float64(h)/float64(nh) - 0.5
 		for x := 0; x < nw; x++ {
-			sx := b.Min.X + x*w/nw
-			dst.Set(x, y, src.At(sx, sy))
+			sx := (float64(x)+0.5)*float64(w)/float64(nw) - 0.5
+			dst.SetNRGBA(x, y, sampleNRGBABilinear(nrgba, sx, sy))
 		}
 	}
 	return dst
+}
+
+// EnhanceSignatureInk sharpens soft ink edges, removes faint semi-transparent halos,
+// and smoothly upscales low-resolution cutouts 2x so thin strokes look crisp on canvas and PDF.
+func EnhanceSignatureInk(src image.Image) *image.NRGBA {
+	if src == nil {
+		return image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	}
+	base := toNRGBA(src)
+	bw, bh := base.Bounds().Dx(), base.Bounds().Dy()
+	if bw <= 0 || bh <= 0 {
+		return base
+	}
+
+	work := base
+	if max(bw, bh) < 900 {
+		nw, nh := bw*2, bh*2
+		up := image.NewNRGBA(image.Rect(0, 0, nw, nh))
+		for y := 0; y < nh; y++ {
+			sy := (float64(y)+0.5)/2.0 - 0.5
+			for x := 0; x < nw; x++ {
+				sx := (float64(x)+0.5)/2.0 - 0.5
+				up.SetNRGBA(x, y, sampleNRGBABilinear(base, sx, sy))
+			}
+		}
+		work = up
+	}
+
+	w, h := work.Bounds().Dx(), work.Bounds().Dy()
+	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			c := work.NRGBAAt(x, y)
+			if c.A == 0 {
+				continue
+			}
+			var sumA float64
+			var count float64
+			for oy := -1; oy <= 1; oy++ {
+				ny := y + oy
+				if ny < 0 || ny >= h {
+					continue
+				}
+				for ox := -1; ox <= 1; ox++ {
+					nx := x + ox
+					if nx < 0 || nx >= w {
+						continue
+					}
+					sumA += float64(work.NRGBAAt(nx, ny).A) / 255.0
+					count++
+				}
+			}
+			avgA := sumA / count
+			a := float64(c.A) / 255.0
+			boosted := a + 0.45*(a-avgA)
+			t := min(max((boosted-0.24)/(0.58-0.24), 0), 1)
+			outA := t * t * (3 - 2*t)
+			alphaByte := uint8(math.Round(outA * 255.0))
+			if alphaByte <= 2 {
+				continue
+			}
+			dst.SetNRGBA(x, y, color.NRGBA{R: c.R, G: c.G, B: c.B, A: alphaByte})
+		}
+	}
+	return dst
+}
+
+func toNRGBA(src image.Image) *image.NRGBA {
+	if nrgba, ok := src.(*image.NRGBA); ok {
+		b := nrgba.Bounds()
+		if b.Min.X == 0 && b.Min.Y == 0 {
+			return nrgba
+		}
+	}
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dst.Set(x, y, src.At(b.Min.X+x, b.Min.Y+y))
+		}
+	}
+	return dst
+}
+
+func sampleNRGBABilinear(src *image.NRGBA, x, y float64) color.NRGBA {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 || x < -0.5 || y < -0.5 || x > float64(w)-0.5 || y > float64(h)-0.5 {
+		return color.NRGBA{}
+	}
+	cx := min(max(x, 0), float64(w-1))
+	cy := min(max(y, 0), float64(h-1))
+	x0 := int(math.Floor(cx))
+	y0 := int(math.Floor(cy))
+	x1 := min(x0+1, w-1)
+	y1 := min(y0+1, h-1)
+	fx := cx - float64(x0)
+	fy := cy - float64(y0)
+
+	c00 := src.NRGBAAt(b.Min.X+x0, b.Min.Y+y0)
+	c10 := src.NRGBAAt(b.Min.X+x1, b.Min.Y+y0)
+	c01 := src.NRGBAAt(b.Min.X+x0, b.Min.Y+y1)
+	c11 := src.NRGBAAt(b.Min.X+x1, b.Min.Y+y1)
+
+	w00 := (1 - fx) * (1 - fy)
+	w10 := fx * (1 - fy)
+	w01 := (1 - fx) * fy
+	w11 := fx * fy
+
+	a00, a10, a01, a11 := float64(c00.A), float64(c10.A), float64(c01.A), float64(c11.A)
+	a := a00*w00 + a10*w10 + a01*w01 + a11*w11
+	if a <= 0.5 {
+		return color.NRGBA{}
+	}
+	r := (float64(c00.R)*a00*w00 + float64(c10.R)*a10*w10 + float64(c01.R)*a01*w01 + float64(c11.R)*a11*w11) / a
+	g := (float64(c00.G)*a00*w00 + float64(c10.G)*a10*w10 + float64(c01.G)*a01*w01 + float64(c11.G)*a11*w11) / a
+	bl := (float64(c00.B)*a00*w00 + float64(c10.B)*a10*w10 + float64(c01.B)*a01*w01 + float64(c11.B)*a11*w11) / a
+	return color.NRGBA{
+		R: uint8(min(max(math.Round(r), 0), 255)),
+		G: uint8(min(max(math.Round(g), 0), 255)),
+		B: uint8(min(max(math.Round(bl), 0), 255)),
+		A: uint8(min(max(math.Round(a), 0), 255)),
+	}
 }
 
 // RemoveBackgroundScaled computes a responsive preview cutout within maxPreviewDim.

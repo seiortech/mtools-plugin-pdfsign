@@ -39,6 +39,7 @@ func TestRenderer(t *testing.T) {
 	}
 
 	renderer := DefaultRenderer()
+	configureTestRenderer(t, renderer)
 	ctx := context.Background()
 
 	count, err := renderer.PageCount(ctx, pdfPath)
@@ -151,6 +152,7 @@ startxref
 	}
 
 	renderer := DefaultRenderer()
+	configureTestRenderer(t, renderer)
 	ctx := context.Background()
 	img, err := renderer.RenderPage(ctx, pdfPath, 1, 1.0)
 	if err != nil {

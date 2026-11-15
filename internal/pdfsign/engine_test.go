@@ -72,6 +72,7 @@ func TestSignPDFSuccess(t *testing.T) {
 
 	// Verify the signed PDF can be rendered and has 1 page
 	renderer := DefaultRenderer()
+	configureTestRenderer(t, renderer)
 	count, err := renderer.PageCount(ctx, outPDF)
 	if err != nil {
 		t.Fatalf("render count on signed PDF failed: %v", err)
@@ -205,6 +206,7 @@ func TestSignPDFWYSIWYGPositionSizeAndRotation(t *testing.T) {
 	}
 
 	renderer := DefaultRenderer()
+	configureTestRenderer(t, renderer)
 	rendered, err := renderer.RenderPage(ctx, outPDF, 1, 1.0)
 	if err != nil {
 		t.Fatalf("RenderPage failed: %v", err)
@@ -295,6 +297,7 @@ func TestSignPDFRotatedPageWYSIWYG(t *testing.T) {
 
 	ctx := context.Background()
 	renderer := DefaultRenderer()
+	configureTestRenderer(t, renderer)
 	w, h, err := renderer.PageDimensions(ctx, inPDF, 1)
 	if err != nil {
 		t.Fatalf("PageDimensions failed: %v", err)

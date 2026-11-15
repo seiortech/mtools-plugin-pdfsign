@@ -581,10 +581,12 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 			ID:   "pdfium_engine_banner",
 			Kind: pluginapi.UINodeRow,
 			Props: mustProps(pluginapi.UIContainerProps{
-				Surface: "sunken",
-				Padding: 12,
-				Gap:     12,
-				Align:   "center",
+				Surface:     "paper",
+				BorderSize:  1,
+				BorderToken: "danger",
+				Padding:     12,
+				Gap:         12,
+				Align:       "center",
 			}),
 			Children: []pluginapi.UINode{
 				{
@@ -600,7 +602,7 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 							Kind: pluginapi.UINodeText,
 							Props: mustProps(pluginapi.UITextProps{
 								Text:    s.T(titleKey),
-								Variant: "warning",
+								Variant: "danger",
 							}),
 						},
 						{

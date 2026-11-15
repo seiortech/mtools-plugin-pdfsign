@@ -140,11 +140,11 @@ xref
 0000000009 00000 n 
 0000000058 00000 n 
 0000000115 00000 n 
-0000000201 00000 n 
+0000000218 00000 n 
 trailer
 << /Size 5 /Root 1 0 R >>
 startxref
-277
+295
 %%EOF`
 	if err := os.WriteFile(pdfPath, []byte(topBlackPDF), 0644); err != nil {
 		t.Fatalf("failed to write test pdf: %v", err)

@@ -63,8 +63,7 @@ func (r *FallbackRenderer) RenderPage(ctx context.Context, pdfPath string, pageN
 		)
 		var out bytes.Buffer
 		cmd.Stdout = &out
-		// pdftoppm writes to stdout if last arg is "-"
-		cmd.Args = append(cmd.Args, "-")
+		// pdftoppm writes to stdout when no output prefix is provided
 		if err := cmd.Run(); err == nil {
 			if img, err := png.Decode(&out); err == nil {
 				return img, nil

@@ -485,3 +485,32 @@ func EncodePNGToBytes(img image.Image) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+// DownscaleToMaxDim returns a nearest-sampled image whose largest side is at most maxDim.
+func DownscaleToMaxDim(src image.Image, maxDim int) image.Image {
+	if src == nil || maxDim <= 0 {
+		return src
+	}
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 || (w <= maxDim && h <= maxDim) {
+		return src
+	}
+	scale := float64(maxDim) / float64(max(w, h))
+	nw := max(int(math.Round(float64(w)*scale)), 1)
+	nh := max(int(math.Round(float64(h)*scale)), 1)
+	dst := image.NewNRGBA(image.Rect(0, 0, nw, nh))
+	for y := 0; y < nh; y++ {
+		sy := b.Min.Y + y*h/nh
+		for x := 0; x < nw; x++ {
+			sx := b.Min.X + x*w/nw
+			dst.Set(x, y, src.At(sx, sy))
+		}
+	}
+	return dst
+}
+
+// RemoveBackgroundScaled computes a responsive preview cutout within maxPreviewDim.
+func RemoveBackgroundScaled(src image.Image, opts PhotoProcessOptions, maxPreviewDim int) *image.NRGBA {
+	return RemoveBackground(DownscaleToMaxDim(src, maxPreviewDim), opts)
+}

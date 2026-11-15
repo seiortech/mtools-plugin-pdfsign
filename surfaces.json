@@ -3,6 +3,11 @@
   "tools": [
     {
       "id": "pdfsign",
+      "live": {
+        "initial_title": "PDF Signature",
+        "mode": "tree",
+        "full_bleed": true
+      },
       "modes": [
         {
           "id": "sign",

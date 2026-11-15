@@ -7,8 +7,6 @@ import (
 	"image"
 	"math"
 	"sync"
-
-	"github.com/egoist/mygo/ui"
 )
 
 // PageRenderer renders a page of a PDF document to an image.Image.
@@ -39,7 +37,6 @@ type PageBitmapCache struct {
 type cacheEntry struct {
 	key PageCacheKey
 	img image.Image
-	bmp *ui.Bitmap
 }
 
 // QuantizeRenderScale snaps continuous zoom to 0.25 increments within [0.25, 3.0]
@@ -88,28 +85,6 @@ func (c *PageBitmapCache) Get(pdfPath string, pageNum int, scale float64) (image
 	return nil, false
 }
 
-// GetBitmap retrieves a cached *ui.Bitmap (creating it once lazily) for the given page and scale.
-func (c *PageBitmapCache) GetBitmap(pdfPath string, pageNum int, scale float64) (*ui.Bitmap, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	key := PageCacheKey{
-		PDFPath:   pdfPath,
-		PageNum:   pageNum,
-		Scale1000: int(math.Round(scale * 1000)),
-	}
-
-	if elem, ok := c.items[key]; ok {
-		c.evictList.MoveToFront(elem)
-		entry := elem.Value.(*cacheEntry)
-		if entry.bmp == nil && entry.img != nil {
-			entry.bmp = ui.NewBitmap(entry.img)
-		}
-		return entry.bmp, entry.bmp != nil
-	}
-	return nil, false
-}
-
 // GetNearest returns any available cached image for the given PDF and page number,
 // useful for smooth continuous zooming before a new raster completes.
 func (c *PageBitmapCache) GetNearest(pdfPath string, pageNum int) (image.Image, bool) {
@@ -123,38 +98,6 @@ func (c *PageBitmapCache) GetNearest(pdfPath string, pageNum int) (image.Image, 
 		}
 	}
 	return nil, false
-}
-
-// GetNearestBitmap returns the cached *ui.Bitmap for (pdfPath, pageNum) whose scale is
-// closest to targetScale, creating the *ui.Bitmap lazily once.
-func (c *PageBitmapCache) GetNearestBitmap(pdfPath string, pageNum int, targetScale float64) (*ui.Bitmap, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	target1000 := int(math.Round(targetScale * 1000))
-	var best *cacheEntry
-	bestDiff := math.MaxInt
-
-	for elem := c.evictList.Front(); elem != nil; elem = elem.Next() {
-		entry := elem.Value.(*cacheEntry)
-		if entry.key.PDFPath == pdfPath && entry.key.PageNum == pageNum {
-			diff := entry.key.Scale1000 - target1000
-			if diff < 0 {
-				diff = -diff
-			}
-			if best == nil || diff < bestDiff {
-				best = entry
-				bestDiff = diff
-			}
-		}
-	}
-	if best == nil || best.img == nil {
-		return nil, false
-	}
-	if best.bmp == nil {
-		best.bmp = ui.NewBitmap(best.img)
-	}
-	return best.bmp, true
 }
 
 // Put stores a rendered page image in the cache.
@@ -175,7 +118,6 @@ func (c *PageBitmapCache) Put(pdfPath string, pageNum int, scale float64, img im
 		c.evictList.MoveToFront(elem)
 		entry := elem.Value.(*cacheEntry)
 		entry.img = img
-		entry.bmp = nil
 		return
 	}
 

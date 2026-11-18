@@ -80,6 +80,7 @@ type studioState struct {
 
 type pdfSignServer struct {
 	mu       sync.Mutex
+	renderMu sync.Mutex
 	rev      uint64
 	dataDir  string
 	appSettingsFile string
@@ -118,9 +119,10 @@ type pdfSignServer struct {
 	pageCache       *pdfsign.PageBitmapCache
 	pageAssets      map[pageAssetKey]string // asset ref ("asset:...")
 	pageAssetFiles  map[string]string       // asset ref -> basename
-	renderSem       chan struct{}
-	inFlightRenders map[pageAssetKey]bool
-	zoomDebounce    *time.Timer
+	renderSem        chan struct{}
+	inFlightRenders  map[pageAssetKey]bool
+	previewRenderErr map[pageAssetKey]string
+	zoomDebounce     *time.Timer
 	assetSeq        int
 
 	// Vault assets & placements
@@ -169,9 +171,10 @@ func newPDFSignServer() *pdfSignServer {
 		pageCache:       pdfsign.NewPageBitmapCache(48),
 		pageAssets:      make(map[pageAssetKey]string),
 		pageAssetFiles:  make(map[string]string),
-		renderSem:       make(chan struct{}, 2),
-		inFlightRenders: make(map[pageAssetKey]bool),
-		vaultAssets:     make(map[string]string),
+		renderSem:        make(chan struct{}, 2),
+		inFlightRenders:  make(map[pageAssetKey]bool),
+		previewRenderErr: make(map[pageAssetKey]string),
+		vaultAssets:      make(map[string]string),
 		placedAssets:    make(map[string]string),
 		placedFiles:     make(map[string]string),
 		studio: studioState{
@@ -322,6 +325,9 @@ func (s *pdfSignServer) Open(ctx context.Context, p pluginapi.UIOpenParams, sess
 	s.sharedPDFiumDir = p.Settings["shared_pdfium_dir"]
 	s.lastSettings = p.Settings
 	s.configureRendererLocked(p.Settings)
+	if ec, ok := s.renderer.(interface{ CheckEngine() error }); ok {
+		s.previewEngineErr = ec.CheckEngine()
+	}
 	s.vault = pdfsign.NewSignatureVault(dataDir)
 	s.history = pdfsign.NewHistoryStore(dataDir)
 	s.syncVaultAssetsLocked(sess)
@@ -387,26 +393,30 @@ func (s *pdfSignServer) Event(ctx context.Context, ev pluginapi.UIEvent, sess *p
 		s.sess = sess
 	}
 	changed := s.handleEventLocked(ctx, ev, sess)
-	var tree pluginapi.UITree
-	if changed {
-		tree = s.buildTreeLocked()
-	}
 	s.mu.Unlock()
 
-	if changed && sess != nil {
-		return sess.Render(tree)
+	if changed {
+		return s.renderAndSend(sess)
 	}
 	return nil
 }
 
-func (s *pdfSignServer) pushTree(sess *pluginapi.UISession) {
+func (s *pdfSignServer) renderAndSend(sess *pluginapi.UISession) error {
 	if sess == nil {
-		return
+		return nil
 	}
+	s.renderMu.Lock()
+	defer s.renderMu.Unlock()
+
 	s.mu.Lock()
 	tree := s.buildTreeLocked()
 	s.mu.Unlock()
-	_ = sess.Render(tree)
+
+	return sess.Render(tree)
+}
+
+func (s *pdfSignServer) pushTree(sess *pluginapi.UISession) {
+	_ = s.renderAndSend(sess)
 }
 
 func (s *pdfSignServer) handleEventLocked(ctx context.Context, ev pluginapi.UIEvent, sess *pluginapi.UISession) bool {
@@ -571,7 +581,12 @@ func (s *pdfSignServer) handleClickLocked(nodeID string, sess *pluginapi.UISessi
 	switch nodeID {
 	case "retry_pdfium":
 		s.previewEngineErr = nil
+		s.previewRenderErr = make(map[pageAssetKey]string)
+		s.inFlightRenders = make(map[pageAssetKey]bool)
 		s.configureRendererLocked(nil)
+		if ec, ok := s.renderer.(interface{ CheckEngine() error }); ok {
+			s.previewEngineErr = ec.CheckEngine()
+		}
 		if s.pdfPath != "" {
 			s.pageCache.ClearForPath(s.pdfPath)
 			s.clearPageAssetsLocked(sess)
@@ -925,35 +940,72 @@ func (s *pdfSignServer) requestPageRenderLocked(pageNum int, scale float64, sess
 		defer func() { <-sem }()
 
 		img, err := renderer.RenderPage(context.Background(), pdfPath, pageNum, scale)
-		s.mu.Lock()
-		delete(s.inFlightRenders, key)
 		if err != nil {
-			if (errors.Is(err, pdfsign.ErrPDFiumMissing) || errors.Is(err, pdfsign.ErrPDFiumInvalid)) && s.docGen == docGen && s.pdfPath == pdfPath {
-				s.previewEngineErr = err
-				tree := s.buildTreeLocked()
+			s.mu.Lock()
+			delete(s.inFlightRenders, key)
+			if s.docGen != docGen || s.pdfPath != pdfPath {
 				s.mu.Unlock()
-				if sess != nil {
-					_ = sess.Render(tree)
-				}
 				return
 			}
+			if errors.Is(err, pdfsign.ErrPDFiumMissing) || errors.Is(err, pdfsign.ErrPDFiumInvalid) || errors.Is(err, pdfsign.ErrNoPreviewEngine) {
+				s.previewEngineErr = err
+			} else {
+				s.previewRenderErr[key] = err.Error()
+			}
+			s.mu.Unlock()
+			_ = s.renderAndSend(sess)
+			return
+		}
+		if img == nil {
+			s.mu.Lock()
+			delete(s.inFlightRenders, key)
 			s.mu.Unlock()
 			return
 		}
-		if img == nil || s.docGen != docGen || s.pdfPath != pdfPath {
+
+		var pngBytes []byte
+		if sess != nil && sess.AssetsDir() != "" {
+			pngBytes, _ = pdfsign.EncodePNGToBytes(img)
+		}
+
+		s.mu.Lock()
+		delete(s.inFlightRenders, key)
+		if s.docGen != docGen || s.pdfPath != pdfPath {
 			s.mu.Unlock()
 			return
 		}
 		s.previewEngineErr = nil
+		delete(s.previewRenderErr, key)
 		s.pageCache.Put(pdfPath, pageNum, scale, img)
-		s.storeRenderedPageAssetLocked(key, img, sess)
-		tree := s.buildTreeLocked()
+		if len(pngBytes) > 0 {
+			s.storeRenderedPageAssetBytesLocked(key, pngBytes, sess)
+		} else {
+			s.storeRenderedPageAssetLocked(key, img, sess)
+		}
 		s.mu.Unlock()
 
-		if sess != nil {
-			_ = sess.Render(tree)
-		}
+		_ = s.renderAndSend(sess)
 	}()
+}
+
+func (s *pdfSignServer) storeRenderedPageAssetBytesLocked(key pageAssetKey, data []byte, sess *pluginapi.UISession) {
+	if sess == nil || len(data) == 0 {
+		return
+	}
+	s.assetSeq++
+	fileName := fmt.Sprintf("page-%d-g%d-s%d-v%d.png", key.pageNum, key.docGen, key.scale1000, s.assetSeq)
+	tmp := filepath.Join(sess.AssetsDir(), ".tmp-"+fileName)
+	final := filepath.Join(sess.AssetsDir(), fileName)
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	ref := "asset:" + fileName
+	s.pageAssets[key] = ref
+	s.pageAssetFiles[ref] = fileName
 }
 
 func (s *pdfSignServer) storeRenderedPageAssetLocked(key pageAssetKey, img image.Image, sess *pluginapi.UISession) {
@@ -1005,6 +1057,7 @@ func (s *pdfSignServer) clearPageAssetsLocked(sess *pluginapi.UISession) {
 	}
 	s.pageAssets = make(map[pageAssetKey]string)
 	s.pageAssetFiles = make(map[string]string)
+	s.previewRenderErr = make(map[pageAssetKey]string)
 }
 
 func (s *pdfSignServer) clearPlacedAssetsLocked(sess *pluginapi.UISession) {
@@ -1369,12 +1422,9 @@ func (s *pdfSignServer) startExportLocked(outPath string, sess *pluginapi.UISess
 				})
 			}
 		}
-		tree := s.buildTreeLocked()
 		s.mu.Unlock()
 
-		if sess != nil {
-			_ = sess.Render(tree)
-		}
+		_ = s.renderAndSend(sess)
 	}()
 }
 

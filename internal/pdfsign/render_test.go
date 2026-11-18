@@ -2,6 +2,7 @@ package pdfsign
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -101,11 +102,15 @@ func TestRenderer(t *testing.T) {
 		t.Errorf("expected 200x300, got %vx%v", fbW, fbH)
 	}
 	fbImg, err := fallback.RenderPage(ctx, pdfPath, 1, 1.0)
-	if err != nil {
-		t.Fatalf("Fallback RenderPage failed: %v", err)
-	}
-	if fbImg.Bounds().Dx() != 200 || fbImg.Bounds().Dy() != 300 {
-		t.Errorf("expected 200x300 fallback image, got %vx%v", fbImg.Bounds().Dx(), fbImg.Bounds().Dy())
+	if _, lookErr := exec.LookPath("pdftoppm"); lookErr == nil {
+		if err != nil {
+			t.Fatalf("Fallback RenderPage with pdftoppm failed: %v", err)
+		}
+		if fbImg.Bounds().Dx() <= 0 || fbImg.Bounds().Dy() <= 0 {
+			t.Errorf("expected positive fallback image dimensions, got %vx%v", fbImg.Bounds().Dx(), fbImg.Bounds().Dy())
+		}
+	} else if !errors.Is(err, ErrNoPreviewEngine) {
+		t.Fatalf("Fallback RenderPage = %v, want ErrNoPreviewEngine", err)
 	}
 }
 

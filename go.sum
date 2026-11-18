@@ -41,8 +41,8 @@ github.com/onsi/gomega v1.44.0/go.mod h1:e/C2HwaZ1DhvjzXXuFhcR7hY7Sh9pl7MmoWKEjz
 github.com/pdfcpu/pdfcpu v0.16.4 h1:XW7q98xu3vNAimTSX93fIWnTDA2F0zz8mu88wiXoMjU=
 github.com/pdfcpu/pdfcpu v0.16.4/go.mod h1:zMjQF5nYZ6A0yaG2d4GAj1QrzM5U8BZYDFHpuRwPuxQ=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
-github.com/seiortech/mtools-sdk v0.2.0 h1:zG71WeDvaUCJHJ8JvE3JkDmdAoh5BjEnu2h5d4pBR+g=
-github.com/seiortech/mtools-sdk v0.2.0/go.mod h1:un70tBvIpmdNd7fID+wTphhhTEP6JxdEK9OPw7rKmJ4=
+github.com/seiortech/mtools-sdk v0.2.1 h1:210e0uOpaMis4bY8oECnvsGacc279xZxI3OM3kxWjWk=
+github.com/seiortech/mtools-sdk v0.2.1/go.mod h1:un70tBvIpmdNd7fID+wTphhhTEP6JxdEK9OPw7rKmJ4=
 github.com/seiortech/mtools-sdk/ui v0.1.1 h1:8dBdK/+o/btE78yjeJHmP6L6CNV7Fbgx9dE53xTQyrc=
 github.com/seiortech/mtools-sdk/ui v0.1.1/go.mod h1:r/uq5Vrbc7HZnElzNqhf7XxLBMLKG3uEA4Jth/uw0oo=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=

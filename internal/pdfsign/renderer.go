@@ -184,3 +184,9 @@ var ErrPDFiumMissing = errors.New("pdfium.wasm is not configured or missing")
 
 // ErrPDFiumInvalid indicates that the configured pdfium.wasm failed validation or failed to initialize.
 var ErrPDFiumInvalid = errors.New("pdfium.wasm is invalid or failed to initialize")
+
+// ErrNoPreviewEngine indicates that no PDF rendering engine is available on this platform.
+var ErrNoPreviewEngine = errors.New("no PDF preview engine is available")
+
+// ErrPasswordRequired indicates that the PDF requires a password to open or render.
+var ErrPasswordRequired = errors.New("pdf password is required or incorrect")

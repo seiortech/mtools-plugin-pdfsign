@@ -505,6 +505,15 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 		})
 
 		if assetRef == "" {
+			loadingText := s.T("pdfsign.rendering_page")
+			loadingVariant := "muted"
+			for ek, emsg := range s.previewRenderErr {
+				if ek.docGen == s.docGen && ek.pageNum == p && emsg != "" {
+					loadingText = s.T("pdfsign.preview_render_failed")
+					loadingVariant = "danger"
+					break
+				}
+			}
 			canvasChildren = append([]pluginapi.UINode{
 				{
 					ID:   fmt.Sprintf("page_loading_%d", p),
@@ -521,8 +530,8 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 							ID:   fmt.Sprintf("page_loading_txt_%d", p),
 							Kind: pluginapi.UINodeText,
 							Props: mustProps(pluginapi.UITextProps{
-								Text:    s.T("pdfsign.rendering_page"),
-								Variant: "muted",
+								Text:    loadingText,
+								Variant: loadingVariant,
 							}),
 						},
 					},
@@ -616,13 +625,45 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 					},
 				},
 				{
-					ID:   "retry_pdfium",
-					Kind: pluginapi.UINodeButton,
-					Props: mustProps(pluginapi.UIButtonProps{
-						Label:   s.T("pdfsign.btn_reload_preview"),
-						Variant: "secondary",
-						Icon:    "refresh-cw",
+					ID:   "pdfium_engine_actions",
+					Kind: pluginapi.UINodeRow,
+					Props: mustProps(pluginapi.UIContainerProps{
+						Gap:         8,
+						Align:       "center",
+						NoFillWidth: true,
 					}),
+					Children: []pluginapi.UINode{
+						{
+							ID:   "download_pdfium",
+							Kind: pluginapi.UINodeButton,
+							Props: mustProps(pluginapi.UIButtonProps{
+								Label:          s.T("pdfsign.btn_download_pdfium"),
+								Variant:        "primary",
+								Icon:           "download",
+								HostAction:     "run_app_setting_action",
+								HostSettingKey: "pdfium_wasm_path",
+							}),
+						},
+						{
+							ID:   "open_settings",
+							Kind: pluginapi.UINodeButton,
+							Props: mustProps(pluginapi.UIButtonProps{
+								Label:      s.T("pdfsign.btn_open_settings"),
+								Variant:    "secondary",
+								Icon:       "settings",
+								HostAction: "open_app_settings",
+							}),
+						},
+						{
+							ID:   "retry_pdfium",
+							Kind: pluginapi.UINodeButton,
+							Props: mustProps(pluginapi.UIButtonProps{
+								Label:   s.T("pdfsign.btn_reload_preview"),
+								Variant: "secondary",
+								Icon:    "refresh-cw",
+							}),
+						},
+					},
 				},
 			},
 		}

@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
+	"io"
 	"math"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +39,12 @@ type PDFiumRenderer struct {
 	poolErr  error
 	compDir  string
 	fallback *FallbackRenderer
+
+	pdfMu      sync.Mutex
+	pdfPath    string
+	pdfSize    int64
+	pdfModTime int64
+	pdfBytes   []byte
 }
 
 // NewPDFiumRenderer creates a new PDFiumRenderer.
@@ -77,12 +85,150 @@ func (r *PDFiumRenderer) Close() error {
 	return err
 }
 
+func (r *PDFiumRenderer) readPDFBytes(pdfPath string) ([]byte, error) {
+	info, err := os.Stat(pdfPath)
+	if err != nil {
+		return nil, fmt.Errorf("stat pdf %s: %w", pdfPath, err)
+	}
+	size := info.Size()
+	modTime := info.ModTime().UnixNano()
+
+	r.pdfMu.Lock()
+	if r.pdfPath == pdfPath && r.pdfSize == size && r.pdfModTime == modTime && r.pdfBytes != nil {
+		data := r.pdfBytes
+		r.pdfMu.Unlock()
+		return data, nil
+	}
+	r.pdfMu.Unlock()
+
+	data, err := os.ReadFile(pdfPath)
+	if err != nil {
+		return nil, fmt.Errorf("read pdf %s: %w", pdfPath, err)
+	}
+
+	r.pdfMu.Lock()
+	r.pdfPath = pdfPath
+	r.pdfSize = size
+	r.pdfModTime = modTime
+	r.pdfBytes = data
+	r.pdfMu.Unlock()
+	return data, nil
+}
+
+// CheckEngine verifies that a preview engine (pdfium.wasm or pdftoppm) is configured
+// without initializing the WebAssembly runtime.
+func (r *PDFiumRenderer) CheckEngine() error {
+	r.mu.Lock()
+	wasmPath := r.cfg.WASMPath
+	r.mu.Unlock()
+
+	if wasmPath == "" {
+		if _, err := exec.LookPath("pdftoppm"); err == nil {
+			return nil
+		}
+		return ErrPDFiumMissing
+	}
+	info, err := os.Stat(wasmPath)
+	if err != nil {
+		if _, lookErr := exec.LookPath("pdftoppm"); lookErr == nil {
+			return nil
+		}
+		if os.IsNotExist(err) {
+			return ErrPDFiumMissing
+		}
+		return fmt.Errorf("%w: %v", ErrPDFiumInvalid, err)
+	}
+	if info.IsDir() || info.Size() < 8 {
+		return ErrPDFiumInvalid
+	}
+	return nil
+}
+
+func wrapOpenDocErr(pdfPath string, err error) error {
+	if strings.Contains(strings.ToLower(err.Error()), "password") {
+		return fmt.Errorf("open pdf %s: %w: %v", pdfPath, ErrPasswordRequired, err)
+	}
+	return fmt.Errorf("open pdf %s: %w", pdfPath, err)
+}
+
 func (r *PDFiumRenderer) PageCount(ctx context.Context, pdfPath string) (int, error) {
-	return r.fallback.PageCount(ctx, pdfPath)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	pool, poolErr := r.ensurePool()
+	if poolErr != nil {
+		return r.fallback.PageCount(ctx, pdfPath)
+	}
+	pdfBytes, err := r.readPDFBytes(pdfPath)
+	if err != nil {
+		return 0, err
+	}
+	instance, err := pool.GetInstance(30 * time.Second)
+	if err != nil {
+		return 0, fmt.Errorf("acquire pdfium instance: %w", err)
+	}
+	defer instance.Close()
+
+	doc, err := instance.OpenDocument(&requests.OpenDocument{File: &pdfBytes})
+	if err != nil {
+		return 0, wrapOpenDocErr(pdfPath, err)
+	}
+	defer func() {
+		_, _ = instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: doc.Document})
+	}()
+
+	resp, err := instance.FPDF_GetPageCount(&requests.FPDF_GetPageCount{Document: doc.Document})
+	if err != nil {
+		return 0, fmt.Errorf("get page count %s: %w", pdfPath, err)
+	}
+	return resp.PageCount, nil
 }
 
 func (r *PDFiumRenderer) PageDimensions(ctx context.Context, pdfPath string, pageNum int) (float64, float64, error) {
-	return r.fallback.PageDimensions(ctx, pdfPath, pageNum)
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	if pageNum < 1 {
+		return 0, 0, ErrPageOutOfRange
+	}
+	pool, poolErr := r.ensurePool()
+	if poolErr != nil {
+		return r.fallback.PageDimensions(ctx, pdfPath, pageNum)
+	}
+	pdfBytes, err := r.readPDFBytes(pdfPath)
+	if err != nil {
+		return 0, 0, err
+	}
+	instance, err := pool.GetInstance(30 * time.Second)
+	if err != nil {
+		return 0, 0, fmt.Errorf("acquire pdfium instance: %w", err)
+	}
+	defer instance.Close()
+
+	doc, err := instance.OpenDocument(&requests.OpenDocument{File: &pdfBytes})
+	if err != nil {
+		return 0, 0, wrapOpenDocErr(pdfPath, err)
+	}
+	defer func() {
+		_, _ = instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: doc.Document})
+	}()
+
+	countResp, err := instance.FPDF_GetPageCount(&requests.FPDF_GetPageCount{Document: doc.Document})
+	if err != nil {
+		return 0, 0, fmt.Errorf("get page count %s: %w", pdfPath, err)
+	}
+	if pageNum > countResp.PageCount {
+		return 0, 0, ErrPageOutOfRange
+	}
+
+	sizeResp, err := instance.FPDF_GetPageSizeByIndexF(&requests.FPDF_GetPageSizeByIndexF{
+		Document: doc.Document,
+		Index:    pageNum - 1,
+	})
+	if err != nil {
+		return 0, 0, fmt.Errorf("get page %d dimensions: %w", pageNum, err)
+	}
+	return float64(sizeResp.Size.Width), float64(sizeResp.Size.Height), nil
 }
 
 func (r *PDFiumRenderer) ensurePool() (pdfium.Pool, error) {
@@ -121,6 +267,8 @@ func (r *PDFiumRenderer) ensurePool() (pdfium.Pool, error) {
 		MaxIdle:  1,
 		MaxTotal: 2,
 		WASM:     wasmBytes,
+		Stdout:   io.Discard,
+		Stderr:   io.Discard,
 	}
 	if r.cfg.CacheDir != "" {
 		if err := os.MkdirAll(r.cfg.CacheDir, 0o755); err == nil {
@@ -166,7 +314,7 @@ func (r *PDFiumRenderer) RenderPage(ctx context.Context, pdfPath string, pageNum
 
 	// Compute DPI with 2x HiDPI multiplier, capped to keep bitmap dimensions within pdfiumMaxDimPx.
 	effectiveScale := scale * pdfiumHiDPIFactor
-	if wPt, hPt, dimErr := r.fallback.PageDimensions(ctx, pdfPath, pageNum); dimErr == nil && wPt > 0 && hPt > 0 {
+	if wPt, hPt, dimErr := r.PageDimensions(ctx, pdfPath, pageNum); dimErr == nil && wPt > 0 && hPt > 0 {
 		maxPt := math.Max(wPt, hPt)
 		if maxPt*effectiveScale > pdfiumMaxDimPx {
 			effectiveScale = pdfiumMaxDimPx / maxPt
@@ -177,9 +325,9 @@ func (r *PDFiumRenderer) RenderPage(ctx context.Context, pdfPath string, pageNum
 		dpi = 36
 	}
 
-	pdfBytes, err := os.ReadFile(pdfPath)
+	pdfBytes, err := r.readPDFBytes(pdfPath)
 	if err != nil {
-		return nil, fmt.Errorf("read pdf %s: %w", pdfPath, err)
+		return nil, err
 	}
 
 	instance, err := pool.GetInstance(30 * time.Second)
@@ -194,7 +342,7 @@ func (r *PDFiumRenderer) RenderPage(ctx context.Context, pdfPath string, pageNum
 
 	doc, err := instance.OpenDocument(&requests.OpenDocument{File: &pdfBytes})
 	if err != nil {
-		return nil, fmt.Errorf("open pdf %s: %w", pdfPath, err)
+		return nil, wrapOpenDocErr(pdfPath, err)
 	}
 	defer func() {
 		_, _ = instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: doc.Document})

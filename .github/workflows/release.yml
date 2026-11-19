@@ -71,10 +71,10 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist/bin dist/bundles
-          go build -trimpath -o dist/bin/tool .
+          go build -buildvcs=false -trimpath -ldflags="-s -w" -o dist/bin/tool .
 
       - name: Install mtools-plugin CLI
-        run: go install github.com/seiortech/mtools-sdk/cmd/mtools-plugin@v0.2.0
+        run: go install github.com/seiortech/mtools-sdk/cmd/mtools-plugin@v0.2.2
 
       - name: Pack and verify signed bundle
         env:

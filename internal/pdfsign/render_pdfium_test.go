@@ -1,3 +1,5 @@
+//go:build !darwin || pdfium
+
 package pdfsign
 
 import (
@@ -5,9 +7,7 @@ import (
 	"errors"
 	"image/color"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -70,45 +70,6 @@ func TestPDFiumRendererMissingAndInvalid(t *testing.T) {
 	if !errors.Is(err, ErrPDFiumInvalid) {
 		t.Fatalf("expected ErrPDFiumInvalid for bad wasm, got %v", err)
 	}
-}
-
-func findTestPDFiumWASM(t *testing.T) string {
-	t.Helper()
-	if p := strings.TrimSpace(os.Getenv("MTOOLS_TEST_PDFIUM_WASM")); p != "" {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	if out, err := exec.Command("go", "env", "GOMODCACHE").Output(); err == nil {
-		modCache := strings.TrimSpace(string(out))
-		if modCache != "" {
-			candidate := filepath.Join(modCache, "github.com", "klippa-app", "go-pdfium@v1.21.4", "internal", "pdfium_wasm", "pdfium.wasm")
-			if _, err := os.Stat(candidate); err == nil {
-				return candidate
-			}
-		}
-	}
-	return ""
-}
-
-func configureTestRenderer(t *testing.T, r PageRenderer) {
-	t.Helper()
-	cr, ok := r.(ConfigurableRenderer)
-	if !ok {
-		return
-	}
-	wasmPath := findTestPDFiumWASM(t)
-	if wasmPath == "" {
-		t.Skip("pdfium.wasm not found in MTOOLS_TEST_PDFIUM_WASM or GOMODCACHE")
-	}
-	cacheDir := filepath.Join(os.TempDir(), "mtools-test-pdfium-cache")
-	cr.Configure(RendererConfig{
-		WASMPath: wasmPath,
-		CacheDir: cacheDir,
-	})
-	t.Cleanup(func() {
-		_ = cr.Close()
-	})
 }
 
 func TestPDFiumRendererRealWASMSmoke(t *testing.T) {

@@ -22,8 +22,8 @@ import (
 	"time"
 
 	"github.com/seiortech/mtools-plugin-pdfsign/internal/pdfsign"
+	"github.com/seiortech/mtools-sdk/i18n"
 	"github.com/seiortech/mtools-sdk/pluginapi"
-	"github.com/seiortech/mtools-sdk/ui/i18n"
 )
 
 //go:embed locales/*.json

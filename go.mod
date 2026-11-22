@@ -6,7 +6,7 @@ require (
 	github.com/ebitengine/purego v0.11.1
 	github.com/klippa-app/go-pdfium v1.21.4
 	github.com/pdfcpu/pdfcpu v0.16.4
-	github.com/seiortech/mtools-sdk v0.2.2
+	github.com/seiortech/mtools-sdk v0.2.3
 	github.com/tetratelabs/wazero v1.12.0
 )
 

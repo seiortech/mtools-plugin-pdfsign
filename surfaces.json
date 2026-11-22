@@ -45,6 +45,14 @@
           "description": "Destination folder for signed PDF files.",
           "default": "~/Downloads",
           "required": true
+        },
+        {
+          "id": "pdfium_wasm_path",
+          "kind": "file",
+          "label": "PDFium WebAssembly override (optional)",
+          "description": "Leave empty to auto-detect pdfium.wasm from your Shared Tools folder (Windows/Linux page preview).",
+          "placeholder": "",
+          "default": ""
         }
       ]
     }

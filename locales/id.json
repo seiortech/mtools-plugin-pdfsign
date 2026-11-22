@@ -58,7 +58,7 @@
     "pdfsign.btn_place_on_page": "Letakkan di Halaman Aktif",
     "pdfsign.rendering_page": "Memuat halaman...",
     "pdfsign.pdfium_missing_title": "Mesin pratinjau PDFium belum dikonfigurasi",
-    "pdfsign.pdfium_missing_desc": "Buka Pengaturan Aplikasi -> PDFium WebAssembly (pdfium.wasm), klik Unduh pdfium.wasm atau pilih pdfium.wasm, lalu klik Muat Ulang Pratinjau.",
+    "pdfsign.pdfium_missing_desc": "Klik Unduh pdfium.wasm untuk menyimpannya di Folder Alat Bersama (dipakai ulang semua plugin PDF), atau ubah foldernya di Pengaturan Aplikasi.",
     "pdfsign.pdfium_invalid_title": "Mesin pratinjau PDFium gagal dimuat",
     "pdfsign.btn_reload_preview": "Muat Ulang Pratinjau",
     "pdfsign.btn_download_pdfium": "Unduh pdfium.wasm",

@@ -339,29 +339,49 @@ func (s *pdfSignServer) configureRendererLocked(settings map[string]string) {
 	if !ok {
 		return
 	}
-	wasmPath := ""
-	if settings != nil {
-		wasmPath = strings.TrimSpace(settings["pdfium_wasm_path"])
+	effective := make(map[string]string, len(s.lastSettings)+len(settings)+1)
+	for k, v := range s.lastSettings {
+		effective[k] = v
 	}
-	if wasmPath == "" && s.appSettingsFile != "" {
+	for k, v := range settings {
+		effective[k] = v
+	}
+	legacyAppWasm := ""
+	if s.appSettingsFile != "" {
 		if raw, err := os.ReadFile(s.appSettingsFile); err == nil {
 			var parsed map[string]any
 			if json.Unmarshal(raw, &parsed) == nil {
-				if v, ok := parsed["pdfium_wasm_path"].(string); ok {
-					wasmPath = strings.TrimSpace(v)
+				if v, ok := parsed[pluginapi.SettingSharedToolsDir].(string); ok && strings.TrimSpace(v) != "" {
+					effective[pluginapi.SettingSharedToolsDir] = strings.TrimSpace(v)
+				}
+				if v, ok := parsed["pdfium_wasm_path"].(string); ok && strings.TrimSpace(v) != "" {
+					legacyAppWasm = strings.TrimSpace(v)
 				}
 			}
 		}
 	}
-	if wasmPath == "" && s.sharedPDFiumDir != "" {
-		candidate := filepath.Join(s.sharedPDFiumDir, "pdfium.wasm")
-		if _, err := os.Stat(candidate); err == nil {
-			wasmPath = candidate
-		}
+	st := pluginapi.NewSharedTools(effective)
+	spec := pluginapi.SharedToolSpec{
+		FileName: "pdfium.wasm",
 	}
+	if s.sharedPDFiumDir != "" {
+		spec.LegacyDirs = append(spec.LegacyDirs, s.sharedPDFiumDir)
+	}
+	if legacyAppWasm != "" {
+		spec.LegacyPaths = append(spec.LegacyPaths, legacyAppWasm)
+	}
+	explicit := ""
+	if settings != nil {
+		explicit = strings.TrimSpace(settings["pdfium_wasm_path"])
+	}
+	if explicit == "" && s.lastSettings != nil {
+		explicit = strings.TrimSpace(s.lastSettings["pdfium_wasm_path"])
+	}
+	wasmPath, _ := st.Resolve(explicit, spec)
+	cacheDir := st.SharedCacheDir("pdfium", s.dataDir)
 	cr.Configure(pdfsign.RendererConfig{
 		WASMPath: wasmPath,
-		CacheDir: filepath.Join(s.dataDir, "pdfium-cache"),
+		CacheDir: cacheDir,
 	})
 }
 

@@ -58,7 +58,7 @@
     "pdfsign.btn_place_on_page": "Place on Active Page",
     "pdfsign.rendering_page": "Rendering page...",
     "pdfsign.pdfium_missing_title": "PDFium preview engine not configured",
-    "pdfsign.pdfium_missing_desc": "Open App Settings -> PDFium WebAssembly (pdfium.wasm), click Download pdfium.wasm or select pdfium.wasm, then click Reload Preview.",
+    "pdfsign.pdfium_missing_desc": "Click Download pdfium.wasm to install it into your Shared Tools folder (reused across all PDF plugins), or change the folder in App Settings.",
     "pdfsign.pdfium_invalid_title": "PDFium preview engine failed to load",
     "pdfsign.btn_reload_preview": "Reload Preview",
     "pdfsign.btn_download_pdfium": "Download pdfium.wasm",

@@ -641,7 +641,7 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 								Variant:        "primary",
 								Icon:           "download",
 								HostAction:     "run_app_setting_action",
-								HostSettingKey: "pdfium_wasm_path",
+								HostSettingKey: "fetch_pdfium",
 							}),
 						},
 						{

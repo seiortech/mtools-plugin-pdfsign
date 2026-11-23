@@ -637,11 +637,19 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 							ID:   "download_pdfium",
 							Kind: pluginapi.UINodeButton,
 							Props: mustProps(pluginapi.UIButtonProps{
-								Label:          s.T("pdfsign.btn_download_pdfium"),
-								Variant:        "primary",
-								Icon:           "download",
-								HostAction:     "run_app_setting_action",
-								HostSettingKey: "fetch_pdfium",
+								Label: func() string {
+									if s.pdfiumDownloading && s.pdfiumDownloadMsg != "" {
+										return s.pdfiumDownloadMsg
+									}
+									if s.pdfiumDownloadErr != "" {
+										return "Retry Download"
+									}
+									return s.T("pdfsign.btn_download_pdfium")
+								}(),
+								Variant:  "primary",
+								Icon:     "download",
+								Disabled: s.pdfiumDownloading,
+								Tooltip:  s.pdfiumDownloadErr,
 							}),
 						},
 						{

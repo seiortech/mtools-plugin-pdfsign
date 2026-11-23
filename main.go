@@ -88,8 +88,11 @@ type pdfSignServer struct {
 	lastSettings    map[string]string
 	vault    *pdfsign.SignatureVault
 	history  *pdfsign.HistoryStore
-	renderer pdfsign.PageRenderer
-	previewEngineErr error
+	renderer          pdfsign.PageRenderer
+	previewEngineErr  error
+	pdfiumDownloading bool
+	pdfiumDownloadMsg string
+	pdfiumDownloadErr string
 	catalog  *i18n.Catalog
 	lang     i18n.Lang
 	sess     *pluginapi.UISession
@@ -296,6 +299,46 @@ func (s *pdfSignServer) Run(ctx context.Context, p pluginapi.RunParams, emit fun
 			Outputs: []string{outFile},
 			Summary: fmt.Sprintf("Signed PDF saved to %s", filepath.Base(outFile)),
 		}, nil
+
+	case "fetch_pdfium":
+		targetDir := ""
+		if dirs := p.Inputs["output_dir"]; len(dirs) > 0 && strings.TrimSpace(dirs[0]) != "" {
+			targetDir = strings.TrimSpace(dirs[0])
+		}
+		if targetDir == "" {
+			targetDir = p.SharedToolsDir()
+		}
+		if targetDir == "" {
+			targetDir = strings.TrimSpace(p.Settings[pluginapi.SettingPluginDataDir])
+		}
+		if targetDir == "" {
+			return pluginapi.RunResult{}, errors.New("shared tools directory is unavailable")
+		}
+		targetPath := filepath.Join(targetDir, "pdfium.wasm")
+		_ = emit(pluginapi.Progress{
+			JobID:   p.JobID,
+			Done:    5,
+			Total:   100,
+			Unit:    "%",
+			Message: "Downloading pdfium.wasm...",
+		})
+		if err := pdfsign.DownloadPDFiumWASM(ctx, targetPath, func(done float64, msg string) {
+			_ = emit(pluginapi.Progress{
+				JobID:   p.JobID,
+				Done:    done * 100,
+				Total:   100,
+				Unit:    "%",
+				Message: msg,
+			})
+		}); err != nil {
+			return pluginapi.RunResult{}, err
+		}
+		return pluginapi.RunResult{
+			JobID:   p.JobID,
+			Outputs: []string{targetPath},
+			Summary: "Installed pdfium.wasm at " + targetPath,
+		}, nil
+
 	default:
 		return pluginapi.RunResult{}, fmt.Errorf("unknown action: %s", p.Action)
 	}
@@ -612,6 +655,53 @@ func (s *pdfSignServer) handleClickLocked(nodeID string, sess *pluginapi.UISessi
 			s.clearPageAssetsLocked(sess)
 			s.triggerVisiblePageRendersLocked(sess)
 		}
+		return true
+	case "download_pdfium":
+		if s.pdfiumDownloading {
+			return false
+		}
+		st := pluginapi.NewSharedTools(s.lastSettings)
+		targetPath := st.SharedToolPath("pdfium.wasm", false)
+		if targetPath == "" && s.dataDir != "" {
+			targetPath = filepath.Join(s.dataDir, "pdfium.wasm")
+		}
+		if targetPath == "" {
+			targetPath = filepath.Join(os.TempDir(), "mtools-tools", "pdfium.wasm")
+		}
+		s.pdfiumDownloading = true
+		s.pdfiumDownloadMsg = "Downloading pdfium.wasm..."
+		s.pdfiumDownloadErr = ""
+		go func(dest string) {
+			dlErr := pdfsign.DownloadPDFiumWASM(context.Background(), dest, func(_ float64, msg string) {
+				s.mu.Lock()
+				s.pdfiumDownloadMsg = msg
+				s.mu.Unlock()
+				s.pushTree(sess)
+			})
+			s.mu.Lock()
+			s.pdfiumDownloading = false
+			if dlErr != nil {
+				s.pdfiumDownloadErr = dlErr.Error()
+				s.pdfiumDownloadMsg = ""
+			} else {
+				s.pdfiumDownloadErr = ""
+				s.pdfiumDownloadMsg = ""
+				s.previewEngineErr = nil
+				s.previewRenderErr = make(map[pageAssetKey]string)
+				s.inFlightRenders = make(map[pageAssetKey]bool)
+				s.configureRendererLocked(nil)
+				if ec, ok := s.renderer.(interface{ CheckEngine() error }); ok {
+					s.previewEngineErr = ec.CheckEngine()
+				}
+				if s.pdfPath != "" {
+					s.pageCache.ClearForPath(s.pdfPath)
+					s.clearPageAssetsLocked(sess)
+					s.triggerVisiblePageRendersLocked(sess)
+				}
+			}
+			s.mu.Unlock()
+			s.pushTree(sess)
+		}(targetPath)
 		return true
 	case "viewport":
 		if s.activeID != "" {

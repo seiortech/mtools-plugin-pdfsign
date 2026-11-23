@@ -7,7 +7,7 @@
   "publisher": {
     "name": "mtools Team"
   },
-  "capabilities": ["process", "files.read", "files.write", "ui.live"],
+  "capabilities": ["process", "files.read", "files.write", "ui.live", "network"],
   "entry": {
     "kind": "sidecar",
     "path": "bin/tool",

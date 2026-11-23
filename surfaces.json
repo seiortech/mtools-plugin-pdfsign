@@ -35,6 +35,11 @@
           "id": "sign",
           "label": "Sign PDF",
           "inputs": ["input_file", "output_file"]
+        },
+        {
+          "id": "fetch_pdfium",
+          "label": "Download pdfium.wasm",
+          "inputs": []
         }
       ],
       "settings": [
@@ -52,7 +57,12 @@
           "label": "PDFium WebAssembly override (optional)",
           "description": "Leave empty to auto-detect pdfium.wasm from your Shared Tools folder (Windows/Linux page preview).",
           "placeholder": "",
-          "default": ""
+          "default": "",
+          "action": {
+            "id": "fetch_pdfium",
+            "label": "Download pdfium.wasm",
+            "description": "Download pdfium.wasm into your Shared Tools folder."
+          }
         }
       ]
     }

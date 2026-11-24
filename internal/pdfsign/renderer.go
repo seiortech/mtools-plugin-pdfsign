@@ -10,6 +10,20 @@ import (
 	"sync"
 )
 
+const (
+	defaultBitmapCacheMaxBytes = 64 << 20 // 64 MiB uncompressed RGBA budget
+	defaultRenderMaxDimPx      = 4096
+	defaultRenderMaxPixels     = 16_777_216 // 16 MP (~64 MiB RGBA)
+	defaultHiDPIFactor         = 2.0
+	maxAdaptiveActualScale     = 3.0
+)
+
+// PageDim represents the width and height of a PDF page in points (72 DPI).
+type PageDim struct {
+	Width  float64
+	Height float64
+}
+
 // PageRenderer renders a page of a PDF document to an image.Image.
 type PageRenderer interface {
 	// PageCount returns the total number of pages in the PDF.
@@ -20,24 +34,108 @@ type PageRenderer interface {
 	RenderPage(ctx context.Context, pdfPath string, pageNum int, scale float64) (image.Image, error)
 }
 
-// PageCacheKey identifies a rendered page bitmap.
+// BatchDimensionRenderer is an optional interface implemented by renderers that can
+// inspect all page dimensions in a single pass instead of re-opening the PDF per page.
+type BatchDimensionRenderer interface {
+	AllPageDimensions(ctx context.Context, pdfPath string) ([]PageDim, error)
+}
+
+// AllPageDimensions reads every page's visual dimensions in points, using a single-pass
+// batch query whenever the renderer supports BatchDimensionRenderer.
+func AllPageDimensions(ctx context.Context, r PageRenderer, pdfPath string) ([]PageDim, error) {
+	if r == nil {
+		return nil, ErrNoPreviewEngine
+	}
+	if br, ok := r.(BatchDimensionRenderer); ok {
+		return br.AllPageDimensions(ctx, pdfPath)
+	}
+	cnt, err := r.PageCount(ctx, pdfPath)
+	if err != nil {
+		return nil, err
+	}
+	if cnt <= 0 {
+		return nil, nil
+	}
+	dims := make([]PageDim, cnt)
+	for p := 1; p <= cnt; p++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		w, h, err := r.PageDimensions(ctx, pdfPath, p)
+		if err != nil {
+			return nil, err
+		}
+		dims[p-1] = PageDim{Width: w, Height: h}
+	}
+	return dims, nil
+}
+
+// computeAdaptiveRenderScale returns the effective raster scale factor (relative to 72 DPI)
+// using 2.0x HiDPI at normal reading zoom (<=1.5x), tapering at extreme zoom so peak
+// bitmap size never exceeds maxDimPx on either edge or maxPixels total area.
+func computeAdaptiveRenderScale(scale, visW, visH float64, maxDimPx int, maxPixels int64) float64 {
+	if scale <= 0 {
+		scale = 1.0
+	}
+	actual := scale * defaultHiDPIFactor
+	capScale := math.Max(scale, maxAdaptiveActualScale)
+	if actual > capScale {
+		actual = capScale
+	}
+	if visW > 0 && visH > 0 {
+		if maxDimPx > 0 {
+			maxPt := math.Max(visW, visH)
+			if maxPt*actual > float64(maxDimPx) {
+				actual = float64(maxDimPx) / maxPt
+			}
+		}
+		if maxPixels > 0 {
+			area := visW * visH * actual * actual
+			if area > float64(maxPixels) {
+				actual = math.Sqrt(float64(maxPixels) / (visW * visH))
+			}
+		}
+	}
+	if actual <= 0 {
+		actual = 0.5
+	}
+	return actual
+}
+
+// PageCacheKey identifies a rendered page bitmap or encoded page PNG.
 type PageCacheKey struct {
 	PDFPath   string
 	PageNum   int
 	Scale1000 int // scale * 1000 rounded to integer
 }
 
-// PageBitmapCache is a thread-safe LRU cache for rendered PDF page bitmaps.
+// PageBitmapCache is a thread-safe LRU cache for rendered PDF page bitmaps
+// bounded by both entry count and estimated uncompressed pixel bytes.
 type PageBitmapCache struct {
-	mu       sync.Mutex
-	capacity int
-	items    map[PageCacheKey]*list.Element
+	mu        sync.Mutex
+	capacity  int
+	maxBytes  int64
+	curBytes  int64
+	items     map[PageCacheKey]*list.Element
 	evictList *list.List
 }
 
 type cacheEntry struct {
-	key PageCacheKey
-	img image.Image
+	key   PageCacheKey
+	img   image.Image
+	bytes int64
+}
+
+func estimateImageBytes(img image.Image) int64 {
+	if img == nil {
+		return 0
+	}
+	b := img.Bounds()
+	w, h := int64(b.Dx()), int64(b.Dy())
+	if w <= 0 || h <= 0 {
+		return 1
+	}
+	return w * h * 4
 }
 
 // QuantizeRenderScale snaps continuous zoom to 0.25 increments within [0.25, 3.0]
@@ -56,13 +154,22 @@ func QuantizeRenderScale(zoom float64) float64 {
 	return q
 }
 
-// NewPageBitmapCache creates an LRU cache with the given capacity (maximum number of pages).
+// NewPageBitmapCache creates an LRU cache with the given entry capacity and a default 64 MiB budget.
 func NewPageBitmapCache(capacity int) *PageBitmapCache {
+	return NewPageBitmapCacheWithBudget(capacity, defaultBitmapCacheMaxBytes)
+}
+
+// NewPageBitmapCacheWithBudget creates an LRU cache bounded by both entry count and pixel bytes.
+func NewPageBitmapCacheWithBudget(capacity int, maxBytes int64) *PageBitmapCache {
 	if capacity <= 0 {
 		capacity = 20
 	}
+	if maxBytes <= 0 {
+		maxBytes = defaultBitmapCacheMaxBytes
+	}
 	return &PageBitmapCache{
 		capacity:  capacity,
+		maxBytes:  maxBytes,
 		items:     make(map[PageCacheKey]*list.Element, capacity),
 		evictList: list.New(),
 	}
@@ -114,25 +221,39 @@ func (c *PageBitmapCache) Put(pdfPath string, pageNum int, scale float64, img im
 		PageNum:   pageNum,
 		Scale1000: int(math.Round(scale * 1000)),
 	}
+	sz := estimateImageBytes(img)
 
 	if elem, ok := c.items[key]; ok {
 		c.evictList.MoveToFront(elem)
 		entry := elem.Value.(*cacheEntry)
+		c.curBytes -= entry.bytes
 		entry.img = img
+		entry.bytes = sz
+		c.curBytes += sz
+		c.evictLocked(elem)
 		return
 	}
 
-	for c.evictList.Len() >= c.capacity {
+	elem := c.evictList.PushFront(&cacheEntry{key: key, img: img, bytes: sz})
+	c.items[key] = elem
+	c.curBytes += sz
+	c.evictLocked(elem)
+}
+
+func (c *PageBitmapCache) evictLocked(keep *list.Element) {
+	for c.evictList.Len() > 1 && (c.evictList.Len() > c.capacity || c.curBytes > c.maxBytes) {
 		oldest := c.evictList.Back()
-		if oldest == nil {
+		if oldest == nil || oldest == keep {
 			break
 		}
+		entry := oldest.Value.(*cacheEntry)
 		c.evictList.Remove(oldest)
-		delete(c.items, oldest.Value.(*cacheEntry).key)
+		delete(c.items, entry.key)
+		c.curBytes -= entry.bytes
+		if c.curBytes < 0 {
+			c.curBytes = 0
+		}
 	}
-
-	elem := c.evictList.PushFront(&cacheEntry{key: key, img: img})
-	c.items[key] = elem
 }
 
 // Clear invalidates all cached pages.
@@ -141,6 +262,7 @@ func (c *PageBitmapCache) Clear() {
 	defer c.mu.Unlock()
 	c.items = make(map[PageCacheKey]*list.Element, c.capacity)
 	c.evictList.Init()
+	c.curBytes = 0
 }
 
 // ClearForPath removes cached entries for a specific PDF.
@@ -155,8 +277,148 @@ func (c *PageBitmapCache) ClearForPath(pdfPath string) {
 		if entry.key.PDFPath == pdfPath {
 			c.evictList.Remove(elem)
 			delete(c.items, entry.key)
+			c.curBytes -= entry.bytes
+			if c.curBytes < 0 {
+				c.curBytes = 0
+			}
 		}
 	}
+}
+
+// Bytes returns the estimated uncompressed bytes currently cached.
+func (c *PageBitmapCache) Bytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.curBytes
+}
+
+// PageBytesCache is a thread-safe, byte-budgeted LRU cache storing compressed PNG page bytes.
+type PageBytesCache struct {
+	mu        sync.Mutex
+	maxBytes  int64
+	curBytes  int64
+	items     map[PageCacheKey]*list.Element
+	evictList *list.List
+}
+
+type byteCacheEntry struct {
+	key  PageCacheKey
+	data []byte
+}
+
+// NewPageBytesCache creates a compressed-byte LRU cache with the given byte budget.
+func NewPageBytesCache(maxBytes int64) *PageBytesCache {
+	if maxBytes <= 0 {
+		maxBytes = 32 << 20
+	}
+	return &PageBytesCache{
+		maxBytes:  maxBytes,
+		items:     make(map[PageCacheKey]*list.Element, 64),
+		evictList: list.New(),
+	}
+}
+
+// Get retrieves cached PNG bytes if present.
+func (c *PageBytesCache) Get(pdfPath string, pageNum int, scale float64) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := PageCacheKey{
+		PDFPath:   pdfPath,
+		PageNum:   pageNum,
+		Scale1000: int(math.Round(scale * 1000)),
+	}
+	if elem, ok := c.items[key]; ok {
+		c.evictList.MoveToFront(elem)
+		return elem.Value.(*byteCacheEntry).data, true
+	}
+	return nil, false
+}
+
+// Put stores compressed PNG bytes, evicting LRU entries to enforce maxBytes.
+func (c *PageBytesCache) Put(pdfPath string, pageNum int, scale float64, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := PageCacheKey{
+		PDFPath:   pdfPath,
+		PageNum:   pageNum,
+		Scale1000: int(math.Round(scale * 1000)),
+	}
+	sz := int64(len(data))
+	if sz > c.maxBytes {
+		return
+	}
+
+	if elem, ok := c.items[key]; ok {
+		c.evictList.MoveToFront(elem)
+		entry := elem.Value.(*byteCacheEntry)
+		c.curBytes -= int64(len(entry.data))
+		entry.data = data
+		c.curBytes += sz
+		c.evictLocked(elem)
+		return
+	}
+
+	elem := c.evictList.PushFront(&byteCacheEntry{key: key, data: data})
+	c.items[key] = elem
+	c.curBytes += sz
+	c.evictLocked(elem)
+}
+
+func (c *PageBytesCache) evictLocked(keep *list.Element) {
+	for c.evictList.Len() > 1 && c.curBytes > c.maxBytes {
+		oldest := c.evictList.Back()
+		if oldest == nil || oldest == keep {
+			break
+		}
+		entry := oldest.Value.(*byteCacheEntry)
+		c.evictList.Remove(oldest)
+		delete(c.items, entry.key)
+		c.curBytes -= int64(len(entry.data))
+		if c.curBytes < 0 {
+			c.curBytes = 0
+		}
+	}
+}
+
+// Clear removes all cached byte entries.
+func (c *PageBytesCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items = make(map[PageCacheKey]*list.Element, 64)
+	c.evictList.Init()
+	c.curBytes = 0
+}
+
+// ClearForPath removes cached byte entries for a specific PDF path.
+func (c *PageBytesCache) ClearForPath(pdfPath string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var next *list.Element
+	for elem := c.evictList.Front(); elem != nil; elem = next {
+		next = elem.Next()
+		entry := elem.Value.(*byteCacheEntry)
+		if entry.key.PDFPath == pdfPath {
+			c.evictList.Remove(elem)
+			delete(c.items, entry.key)
+			c.curBytes -= int64(len(entry.data))
+			if c.curBytes < 0 {
+				c.curBytes = 0
+			}
+		}
+	}
+}
+
+// Bytes returns the total compressed bytes currently held in cache.
+func (c *PageBytesCache) Bytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.curBytes
 }
 
 // DefaultRenderer returns the platform-recommended PageRenderer.

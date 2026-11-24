@@ -140,8 +140,7 @@ func DownloadPDFiumWASMWithClient(ctx context.Context, client *http.Client, rawU
 		return fmt.Errorf("%w: got %s, want %s", ErrPDFiumDownloadChecksum, gotSHA, expectedSHA256)
 	}
 
-	_ = os.Remove(targetPath)
-	if err := os.Rename(tmpPath, targetPath); err != nil {
+	if err := replaceFileAtomic(tmpPath, targetPath); err != nil {
 		return fmt.Errorf("install pdfium.wasm: %w", err)
 	}
 	cleanupTmp = false

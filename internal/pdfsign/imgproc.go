@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"math"
 )
@@ -38,10 +39,10 @@ type Point struct {
 
 // Stroke represents a single continuous freehand stroke.
 type Stroke struct {
-	Points  []Point    `json:"points"`
-	Width   float64    `json:"width"`
-	Color   color.RGBA `json:"color"`
-	Eraser  bool       `json:"eraser"`
+	Points []Point    `json:"points"`
+	Width  float64    `json:"width"`
+	Color  color.RGBA `json:"color"`
+	Eraser bool       `json:"eraser"`
 }
 
 // PhotoProcessOptions configures paper background removal and recoloring.
@@ -62,6 +63,40 @@ func DefaultPhotoProcessOptions() PhotoProcessOptions {
 	}
 }
 
+func buildAlphaLUT(thresh, contrast float64) [1025]uint8 {
+	var lut [1025]uint8
+	invContrast := 1.0 / contrast
+	for i := 0; i <= 1024; i++ {
+		lum := float64(i) / 1024.0
+		if lum >= thresh {
+			continue
+		}
+		rawAlpha := (thresh - lum) / thresh
+		alpha := math.Pow(rawAlpha, invContrast)
+		if alpha > 1.0 {
+			alpha = 1.0
+		}
+		if alpha <= 0.01 {
+			continue
+		}
+		lut[i] = uint8(math.Round(alpha * 255.0))
+	}
+	return lut
+}
+
+func inkRGBForRemoveBG(mode InkColorMode) (uint8, uint8, uint8, bool) {
+	switch mode {
+	case InkBlack:
+		return 31, 40, 34, true
+	case InkBlue:
+		return 29, 78, 216, true
+	case InkRed:
+		return 185, 28, 28, true
+	default:
+		return 0, 0, 0, false
+	}
+}
+
 // RemoveBackground strips white/light paper background from an image,
 // converting the paper to transparent alpha while keeping or recoloring ink strokes.
 func RemoveBackground(src image.Image, opts PhotoProcessOptions) *image.NRGBA {
@@ -72,7 +107,6 @@ func RemoveBackground(src image.Image, opts PhotoProcessOptions) *image.NRGBA {
 		return image.NewNRGBA(image.Rect(0, 0, 1, 1))
 	}
 
-	// Calculate crop bounds
 	cropX := int(opts.Crop.X * float64(srcW))
 	cropY := int(opts.Crop.Y * float64(srcH))
 	cropW := int(opts.Crop.W * float64(srcW))
@@ -102,60 +136,140 @@ func RemoveBackground(src image.Image, opts PhotoProcessOptions) *image.NRGBA {
 		contrast = 1.0
 	}
 
-	for y := 0; y < cropH; y++ {
-		for x := 0; x < cropW; x++ {
-			c := src.At(bounds.Min.X+cropX+x, bounds.Min.Y+cropY+y)
-			r, g, b, a := c.RGBA()
-			if a == 0 {
-				dst.SetNRGBA(x, y, color.NRGBA{0, 0, 0, 0})
-				continue
-			}
+	lut := buildAlphaLUT(thresh, contrast)
+	tintR, tintG, tintB, useTint := inkRGBForRemoveBG(opts.InkMode)
+	startX := bounds.Min.X + cropX
+	startY := bounds.Min.Y + cropY
 
-			// Normalized RGB in [0, 1]
-			rf := float64(r) / float64(a)
-			gf := float64(g) / float64(a)
-			bf := float64(b) / float64(a)
-
-			// Perceptual luminance: 0 (black) to 1 (pure white)
-			lum := 0.299*rf + 0.587*gf + 0.114*bf
-
-			// Darkness factor: 1.0 for darkest ink, 0.0 for paper
-			// Lum > thresh is paper -> alpha 0
-			// Lum <= thresh ramps alpha up
-			var alpha float64
-			if lum >= thresh {
-				alpha = 0
-			} else {
-				// Linear ramp from thresh down to 0
-				rawAlpha := (thresh - lum) / thresh
-				// Apply contrast curve
-				alpha = math.Pow(rawAlpha, 1.0/contrast)
-				if alpha > 1.0 {
-					alpha = 1.0
+	switch s := src.(type) {
+	case *image.NRGBA:
+		for y := 0; y < cropH; y++ {
+			srcRow := s.PixOffset(startX, startY+y)
+			dstRow := y * dst.Stride
+			for x := 0; x < cropW; x++ {
+				so := srcRow + x*4
+				a := s.Pix[so+3]
+				if a == 0 {
+					continue
 				}
+				r, g, b := s.Pix[so], s.Pix[so+1], s.Pix[so+2]
+				lumIdx := (306*int(r) + 601*int(g) + 117*int(b) + 127) / 255
+				alphaByte := lut[lumIdx]
+				if alphaByte == 0 {
+					continue
+				}
+				do := dstRow + x*4
+				if useTint {
+					dst.Pix[do] = tintR
+					dst.Pix[do+1] = tintG
+					dst.Pix[do+2] = tintB
+				} else {
+					dst.Pix[do] = r
+					dst.Pix[do+1] = g
+					dst.Pix[do+2] = b
+				}
+				dst.Pix[do+3] = alphaByte
 			}
+		}
 
-			if alpha <= 0.01 {
-				dst.SetNRGBA(x, y, color.NRGBA{0, 0, 0, 0})
-				continue
+	case *image.RGBA:
+		for y := 0; y < cropH; y++ {
+			srcRow := s.PixOffset(startX, startY+y)
+			dstRow := y * dst.Stride
+			for x := 0; x < cropW; x++ {
+				so := srcRow + x*4
+				a := s.Pix[so+3]
+				if a == 0 {
+					continue
+				}
+				r, g, b := s.Pix[so], s.Pix[so+1], s.Pix[so+2]
+				if a != 255 {
+					ai := int(a)
+					r = uint8(min((int(r)*255+ai/2)/ai, 255))
+					g = uint8(min((int(g)*255+ai/2)/ai, 255))
+					b = uint8(min((int(b)*255+ai/2)/ai, 255))
+				}
+				lumIdx := (306*int(r) + 601*int(g) + 117*int(b) + 127) / 255
+				alphaByte := lut[lumIdx]
+				if alphaByte == 0 {
+					continue
+				}
+				do := dstRow + x*4
+				if useTint {
+					dst.Pix[do] = tintR
+					dst.Pix[do+1] = tintG
+					dst.Pix[do+2] = tintB
+				} else {
+					dst.Pix[do] = r
+					dst.Pix[do+1] = g
+					dst.Pix[do+2] = b
+				}
+				dst.Pix[do+3] = alphaByte
 			}
+		}
 
-			alphaByte := uint8(math.Round(alpha * 255.0))
+	case *image.YCbCr:
+		for y := 0; y < cropH; y++ {
+			sy := startY + y
+			dstRow := y * dst.Stride
+			for x := 0; x < cropW; x++ {
+				sx := startX + x
+				yv := s.Y[s.YOffset(sx, sy)]
+				if useTint {
+					lumIdx := (int(yv)*1024 + 127) / 255
+					alphaByte := lut[lumIdx]
+					if alphaByte == 0 {
+						continue
+					}
+					do := dstRow + x*4
+					dst.Pix[do] = tintR
+					dst.Pix[do+1] = tintG
+					dst.Pix[do+2] = tintB
+					dst.Pix[do+3] = alphaByte
+					continue
+				}
+				co := s.COffset(sx, sy)
+				r, g, b := color.YCbCrToRGB(yv, s.Cb[co], s.Cr[co])
+				lumIdx := (306*int(r) + 601*int(g) + 117*int(b) + 127) / 255
+				alphaByte := lut[lumIdx]
+				if alphaByte == 0 {
+					continue
+				}
+				do := dstRow + x*4
+				dst.Pix[do] = r
+				dst.Pix[do+1] = g
+				dst.Pix[do+2] = b
+				dst.Pix[do+3] = alphaByte
+			}
+		}
 
-			switch opts.InkMode {
-			case InkBlack:
-				dst.SetNRGBA(x, y, color.NRGBA{R: 31, G: 40, B: 34, A: alphaByte})
-			case InkBlue:
-				dst.SetNRGBA(x, y, color.NRGBA{R: 29, G: 78, B: 216, A: alphaByte})
-			case InkRed:
-				dst.SetNRGBA(x, y, color.NRGBA{R: 185, G: 28, B: 28, A: alphaByte})
-			case InkOriginal:
-				dst.SetNRGBA(x, y, color.NRGBA{
-					R: uint8(math.Round(rf * 255.0)),
-					G: uint8(math.Round(gf * 255.0)),
-					B: uint8(math.Round(bf * 255.0)),
-					A: alphaByte,
-				})
+	default:
+		for y := 0; y < cropH; y++ {
+			dstRow := y * dst.Stride
+			for x := 0; x < cropW; x++ {
+				r, g, b, a := src.At(startX+x, startY+y).RGBA()
+				if a == 0 {
+					continue
+				}
+				r8 := uint8(min((r*255+a/2)/a, 255))
+				g8 := uint8(min((g*255+a/2)/a, 255))
+				b8 := uint8(min((b*255+a/2)/a, 255))
+				lumIdx := (306*int(r8) + 601*int(g8) + 117*int(b8) + 127) / 255
+				alphaByte := lut[lumIdx]
+				if alphaByte == 0 {
+					continue
+				}
+				do := dstRow + x*4
+				if useTint {
+					dst.Pix[do] = tintR
+					dst.Pix[do+1] = tintG
+					dst.Pix[do+2] = tintB
+				} else {
+					dst.Pix[do] = r8
+					dst.Pix[do+1] = g8
+					dst.Pix[do+2] = b8
+				}
+				dst.Pix[do+3] = alphaByte
 			}
 		}
 	}
@@ -179,9 +293,9 @@ func AutoTrimAlphaBounds(src *image.NRGBA, alphaMin uint8) *image.NRGBA {
 	maxX, maxY := -1, -1
 
 	for y := 0; y < h; y++ {
+		rowOff := src.PixOffset(bounds.Min.X, bounds.Min.Y+y)
 		for x := 0; x < w; x++ {
-			c := src.NRGBAAt(x, y)
-			if c.A > alphaMin {
+			if src.Pix[rowOff+x*4+3] > alphaMin {
 				if x < minX {
 					minX = x
 				}
@@ -199,12 +313,10 @@ func AutoTrimAlphaBounds(src *image.NRGBA, alphaMin uint8) *image.NRGBA {
 	}
 
 	if maxX < minX || maxY < minY {
-		// Image is completely transparent
 		return image.NewNRGBA(image.Rect(0, 0, 1, 1))
 	}
 
-	// Add small 2px padding
-	pad := 2
+	const pad = 2
 	minX = max(0, minX-pad)
 	minY = max(0, minY-pad)
 	maxX = min(w-1, maxX+pad)
@@ -213,14 +325,35 @@ func AutoTrimAlphaBounds(src *image.NRGBA, alphaMin uint8) *image.NRGBA {
 	trimmedW := maxX - minX + 1
 	trimmedH := maxY - minY + 1
 	dst := image.NewNRGBA(image.Rect(0, 0, trimmedW, trimmedH))
+	rowBytes := trimmedW * 4
 
 	for y := 0; y < trimmedH; y++ {
-		for x := 0; x < trimmedW; x++ {
-			dst.SetNRGBA(x, y, src.NRGBAAt(minX+x, minY+y))
-		}
+		srcOff := src.PixOffset(bounds.Min.X+minX, bounds.Min.Y+minY+y)
+		dstOff := y * dst.Stride
+		copy(dst.Pix[dstOff:dstOff+rowBytes], src.Pix[srcOff:srcOff+rowBytes])
 	}
 
 	return dst
+}
+
+// RenderStrokeOnto rasterizes a single freehand stroke incrementally onto an existing NRGBA canvas.
+func RenderStrokeOnto(dst *image.NRGBA, s Stroke) {
+	if dst == nil || len(s.Points) == 0 {
+		return
+	}
+	radius := s.Width / 2.0
+	if radius < 0.5 {
+		radius = 1.0
+	}
+	if len(s.Points) == 1 {
+		drawFilledCircle(dst, s.Points[0].X, s.Points[0].Y, radius, s.Color, s.Eraser)
+		return
+	}
+	for i := 0; i < len(s.Points)-1; i++ {
+		p0 := s.Points[i]
+		p1 := s.Points[i+1]
+		drawThickLine(dst, p0.X, p0.Y, p1.X, p1.Y, radius, s.Color, s.Eraser)
+	}
 }
 
 // RenderStrokesToImage rasterizes freehand strokes onto a transparent NRGBA image.
@@ -232,30 +365,9 @@ func RenderStrokesToImage(w, h int, strokes []Stroke) *image.NRGBA {
 		h = 300
 	}
 	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
-
 	for _, s := range strokes {
-		if len(s.Points) == 0 {
-			continue
-		}
-		radius := s.Width / 2.0
-		if radius < 0.5 {
-			radius = 1.0
-		}
-
-		if len(s.Points) == 1 {
-			// Single dot
-			drawFilledCircle(dst, s.Points[0].X, s.Points[0].Y, radius, s.Color, s.Eraser)
-			continue
-		}
-
-		// Draw smooth connected segments
-		for i := 0; i < len(s.Points)-1; i++ {
-			p0 := s.Points[i]
-			p1 := s.Points[i+1]
-			drawThickLine(dst, p0.X, p0.Y, p1.X, p1.Y, radius, s.Color, s.Eraser)
-		}
+		RenderStrokeOnto(dst, s)
 	}
-
 	return dst
 }
 
@@ -265,19 +377,28 @@ func drawFilledCircle(img *image.NRGBA, cx, cy, r float64, c color.RGBA, eraser 
 	maxX := min(bounds.Max.X-1, int(math.Ceil(cx+r)))
 	minY := max(bounds.Min.Y, int(math.Floor(cy-r)))
 	maxY := min(bounds.Max.Y-1, int(math.Ceil(cy+r)))
+	if minX > maxX || minY > maxY {
+		return
+	}
 
 	r2 := r * r
-	col := color.NRGBA{R: c.R, G: c.G, B: c.B, A: c.A}
+	cr, cg, cb, ca := c.R, c.G, c.B, c.A
 	if eraser {
-		col = color.NRGBA{0, 0, 0, 0}
+		cr, cg, cb, ca = 0, 0, 0, 0
 	}
 
 	for y := minY; y <= maxY; y++ {
+		dy := float64(y) - cy
+		dy2 := dy * dy
+		rowOff := img.PixOffset(0, y)
 		for x := minX; x <= maxX; x++ {
 			dx := float64(x) - cx
-			dy := float64(y) - cy
-			if dx*dx+dy*dy <= r2 {
-				img.SetNRGBA(x, y, col)
+			if dx*dx+dy2 <= r2 {
+				off := rowOff + x*4
+				img.Pix[off] = cr
+				img.Pix[off+1] = cg
+				img.Pix[off+2] = cb
+				img.Pix[off+3] = ca
 			}
 		}
 	}
@@ -292,7 +413,6 @@ func drawThickLine(img *image.NRGBA, x0, y0, x1, y1, r float64, c color.RGBA, er
 		return
 	}
 
-	// Step by 0.5 radius along the line for continuous smooth stroke
 	step := math.Max(0.5, r*0.5)
 	steps := int(math.Ceil(dist / step))
 	for i := 0; i <= steps; i++ {
@@ -319,7 +439,7 @@ func DefaultPlacementRenderOptions() PlacementRenderOptions {
 }
 
 // RenderPlacementImage pre-renders the signature with sub-crop, rotation, and opacity
-// into a high-DPI transparent NRGBA image.
+// into a straight-alpha transparent NRGBA image.
 func RenderPlacementImage(src image.Image, opts PlacementRenderOptions) *image.NRGBA {
 	bounds := src.Bounds()
 	srcW := bounds.Dx()
@@ -328,7 +448,6 @@ func RenderPlacementImage(src image.Image, opts PlacementRenderOptions) *image.N
 		return image.NewNRGBA(image.Rect(0, 0, 1, 1))
 	}
 
-	// 1. Apply sub-crop
 	cropX := int(opts.Crop.X * float64(srcW))
 	cropY := int(opts.Crop.Y * float64(srcH))
 	cropW := int(opts.Crop.W * float64(srcW))
@@ -347,30 +466,62 @@ func RenderPlacementImage(src image.Image, opts PlacementRenderOptions) *image.N
 		cropH = srcH - cropY
 	}
 
+	opacity := opts.Opacity
+	if opacity < 0 {
+		opacity = 0
+	} else if opacity > 1.0 {
+		opacity = 1.0
+	}
+
 	cropped := image.NewNRGBA(image.Rect(0, 0, cropW, cropH))
-	for y := 0; y < cropH; y++ {
-		for x := 0; x < cropW; x++ {
-			c := src.At(bounds.Min.X+cropX+x, bounds.Min.Y+cropY+y)
-			r, g, b, a := c.RGBA()
-			if a == 0 {
-				continue
+	startX := bounds.Min.X + cropX
+	startY := bounds.Min.Y + cropY
+
+	switch s := src.(type) {
+	case *image.NRGBA:
+		if opacity >= 0.9999 {
+			rowBytes := cropW * 4
+			for y := 0; y < cropH; y++ {
+				srcOff := s.PixOffset(startX, startY+y)
+				dstOff := y * cropped.Stride
+				copy(cropped.Pix[dstOff:dstOff+rowBytes], s.Pix[srcOff:srcOff+rowBytes])
 			}
-			alpha := float64(a) / 65535.0 * opts.Opacity
-			if alpha < 0 {
-				alpha = 0
-			} else if alpha > 1.0 {
-				alpha = 1.0
+		} else {
+			for y := 0; y < cropH; y++ {
+				srcRow := s.PixOffset(startX, startY+y)
+				dstRow := y * cropped.Stride
+				for x := 0; x < cropW; x++ {
+					so := srcRow + x*4
+					a := s.Pix[so+3]
+					if a == 0 {
+						continue
+					}
+					do := dstRow + x*4
+					cropped.Pix[do] = s.Pix[so]
+					cropped.Pix[do+1] = s.Pix[so+1]
+					cropped.Pix[do+2] = s.Pix[so+2]
+					cropped.Pix[do+3] = uint8(math.Round(float64(a) * opacity))
+				}
 			}
-			cropped.SetNRGBA(x, y, color.NRGBA{
-				R: uint8(r >> 8),
-				G: uint8(g >> 8),
-				B: uint8(b >> 8),
-				A: uint8(math.Round(alpha * 255.0)),
-			})
+		}
+	default:
+		// Un-premultiply RGBA() channels so semi-transparent anti-aliased ink edges never darken.
+		for y := 0; y < cropH; y++ {
+			dstRow := y * cropped.Stride
+			for x := 0; x < cropW; x++ {
+				r, g, b, a := src.At(startX+x, startY+y).RGBA()
+				if a == 0 {
+					continue
+				}
+				do := dstRow + x*4
+				cropped.Pix[do] = uint8(min((r*255+a/2)/a, 255))
+				cropped.Pix[do+1] = uint8(min((g*255+a/2)/a, 255))
+				cropped.Pix[do+2] = uint8(min((b*255+a/2)/a, 255))
+				cropped.Pix[do+3] = uint8(math.Round((float64(a) / 65535.0) * opacity * 255.0))
+			}
 		}
 	}
 
-	// 2. Rotate if needed
 	rot := math.Mod(opts.RotationDeg, 360)
 	if rot < 0 {
 		rot += 360
@@ -379,13 +530,53 @@ func RenderPlacementImage(src image.Image, opts PlacementRenderOptions) *image.N
 		return cropped
 	}
 
+	// Exact lossless fast paths for orthogonal 90/180/270 degree clockwise rotations.
+	if math.Abs(rot-90) < 0.1 {
+		dst := image.NewNRGBA(image.Rect(0, 0, cropH, cropW))
+		for sy := 0; sy < cropH; sy++ {
+			srcRow := sy * cropped.Stride
+			dx := cropH - 1 - sy
+			for sx := 0; sx < cropW; sx++ {
+				so := srcRow + sx*4
+				do := sx*dst.Stride + dx*4
+				copy(dst.Pix[do:do+4], cropped.Pix[so:so+4])
+			}
+		}
+		return dst
+	}
+	if math.Abs(rot-180) < 0.1 {
+		dst := image.NewNRGBA(image.Rect(0, 0, cropW, cropH))
+		for sy := 0; sy < cropH; sy++ {
+			srcRow := sy * cropped.Stride
+			dstRow := (cropH - 1 - sy) * dst.Stride
+			for sx := 0; sx < cropW; sx++ {
+				so := srcRow + sx*4
+				do := dstRow + (cropW-1-sx)*4
+				copy(dst.Pix[do:do+4], cropped.Pix[so:so+4])
+			}
+		}
+		return dst
+	}
+	if math.Abs(rot-270) < 0.1 {
+		dst := image.NewNRGBA(image.Rect(0, 0, cropH, cropW))
+		for sy := 0; sy < cropH; sy++ {
+			srcRow := sy * cropped.Stride
+			dx := sy
+			for sx := 0; sx < cropW; sx++ {
+				so := srcRow + sx*4
+				do := (cropW-1-sx)*dst.Stride + dx*4
+				copy(dst.Pix[do:do+4], cropped.Pix[so:so+4])
+			}
+		}
+		return dst
+	}
+
 	rad := rot * math.Pi / 180.0
 	cosA := math.Cos(rad)
 	sinA := math.Sin(rad)
 
-	// Calculate new rotated bounding box
 	w0, h0 := float64(cropW), float64(cropH)
-	corners := [][2]float64{
+	corners := [4][2]float64{
 		{-w0 / 2, -h0 / 2},
 		{w0 / 2, -h0 / 2},
 		{w0 / 2, h0 / 2},
@@ -403,14 +594,8 @@ func RenderPlacementImage(src image.Image, opts PlacementRenderOptions) *image.N
 		maxRotY = math.Max(maxRotY, ry)
 	}
 
-	rotW := int(math.Ceil(maxRotX - minRotX))
-	rotH := int(math.Ceil(maxRotY - minRotY))
-	if rotW <= 0 {
-		rotW = 1
-	}
-	if rotH <= 0 {
-		rotH = 1
-	}
+	rotW := max(int(math.Ceil(maxRotX-minRotX)), 1)
+	rotH := max(int(math.Ceil(maxRotY-minRotY)), 1)
 
 	dst := image.NewNRGBA(image.Rect(0, 0, rotW, rotH))
 	dstCX := float64(rotW) / 2.0
@@ -418,19 +603,22 @@ func RenderPlacementImage(src image.Image, opts PlacementRenderOptions) *image.N
 	srcCX := w0 / 2.0
 	srcCY := h0 / 2.0
 
-	// Inverse rotation mapping
 	invCos := math.Cos(-rad)
 	invSin := math.Sin(-rad)
 
 	for dy := 0; dy < rotH; dy++ {
+		yRel := float64(dy) + 0.5 - dstCY
+		dstRow := dy * dst.Stride
 		for dx := 0; dx < rotW; dx++ {
 			xRel := float64(dx) + 0.5 - dstCX
-			yRel := float64(dy) + 0.5 - dstCY
-
 			sx := xRel*invCos - yRel*invSin + srcCX - 0.5
 			sy := xRel*invSin + yRel*invCos + srcCY - 0.5
-
-			dst.SetNRGBA(dx, dy, sampleNRGBABilinear(cropped, sx, sy))
+			c := sampleNRGBABilinear(cropped, sx, sy)
+			do := dstRow + dx*4
+			dst.Pix[do] = c.R
+			dst.Pix[do+1] = c.G
+			dst.Pix[do+2] = c.B
+			dst.Pix[do+3] = c.A
 		}
 	}
 
@@ -442,44 +630,103 @@ func RecolorSignature(src image.Image, mode InkColorMode) *image.NRGBA {
 	bounds := src.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
 	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
+	if w <= 0 || h <= 0 {
+		return dst
+	}
 	if mode == InkOriginal {
-		for y := 0; y < h; y++ {
-			for x := 0; x < w; x++ {
-				dst.Set(x, y, src.At(bounds.Min.X+x, bounds.Min.Y+y))
-			}
-		}
+		draw.Draw(dst, dst.Bounds(), src, bounds.Min, draw.Src)
 		return dst
 	}
 
+	var tintR, tintG, tintB uint8
+	knownTint := true
+	switch mode {
+	case InkBlack:
+		tintR, tintG, tintB = 20, 20, 20
+	case InkBlue:
+		tintR, tintG, tintB = 20, 50, 180
+	case InkRed:
+		tintR, tintG, tintB = 190, 25, 25
+	default:
+		knownTint = false
+	}
+
+	if knownTint {
+		switch s := src.(type) {
+		case *image.NRGBA:
+			for y := 0; y < h; y++ {
+				srcRow := s.PixOffset(bounds.Min.X, bounds.Min.Y+y)
+				dstRow := y * dst.Stride
+				for x := 0; x < w; x++ {
+					a := s.Pix[srcRow+x*4+3]
+					if a == 0 {
+						continue
+					}
+					do := dstRow + x*4
+					dst.Pix[do] = tintR
+					dst.Pix[do+1] = tintG
+					dst.Pix[do+2] = tintB
+					dst.Pix[do+3] = a
+				}
+			}
+			return dst
+		case *image.RGBA:
+			for y := 0; y < h; y++ {
+				srcRow := s.PixOffset(bounds.Min.X, bounds.Min.Y+y)
+				dstRow := y * dst.Stride
+				for x := 0; x < w; x++ {
+					a := s.Pix[srcRow+x*4+3]
+					if a == 0 {
+						continue
+					}
+					do := dstRow + x*4
+					dst.Pix[do] = tintR
+					dst.Pix[do+1] = tintG
+					dst.Pix[do+2] = tintB
+					dst.Pix[do+3] = a
+				}
+			}
+			return dst
+		}
+	}
+
 	for y := 0; y < h; y++ {
+		dstRow := y * dst.Stride
 		for x := 0; x < w; x++ {
-			c := src.At(bounds.Min.X+x, bounds.Min.Y+y)
-			r, g, b, a := c.RGBA()
+			r, g, b, a := src.At(bounds.Min.X+x, bounds.Min.Y+y).RGBA()
 			if a == 0 {
 				continue
 			}
-			alpha8 := uint8(a >> 8)
-			var tint color.NRGBA
-			switch mode {
-			case InkBlack:
-				tint = color.NRGBA{R: 20, G: 20, B: 20, A: alpha8}
-			case InkBlue:
-				tint = color.NRGBA{R: 20, G: 50, B: 180, A: alpha8}
-			case InkRed:
-				tint = color.NRGBA{R: 190, G: 25, B: 25, A: alpha8}
-			default:
-				tint = color.NRGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: alpha8}
+			do := dstRow + x*4
+			if knownTint {
+				dst.Pix[do] = tintR
+				dst.Pix[do+1] = tintG
+				dst.Pix[do+2] = tintB
+			} else {
+				dst.Pix[do] = uint8(min((r*255+a/2)/a, 255))
+				dst.Pix[do+1] = uint8(min((g*255+a/2)/a, 255))
+				dst.Pix[do+2] = uint8(min((b*255+a/2)/a, 255))
 			}
-			dst.SetNRGBA(x, y, tint)
+			dst.Pix[do+3] = uint8(a >> 8)
 		}
 	}
 	return dst
 }
 
-// EncodePNGToBytes helper encodes image.Image to PNG format byte slice.
+// EncodePNGToBytes encodes image.Image to PNG using default compression (for persistent vault/PDF export).
 func EncodePNGToBytes(img image.Image) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// EncodeFastPNGToBytes encodes image.Image using png.BestSpeed for ephemeral live UI preview assets.
+func EncodeFastPNGToBytes(img image.Image) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&buf, img); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
@@ -502,9 +749,15 @@ func DownscaleToMaxDim(src image.Image, maxDim int) image.Image {
 	dst := image.NewNRGBA(image.Rect(0, 0, nw, nh))
 	for y := 0; y < nh; y++ {
 		sy := (float64(y)+0.5)*float64(h)/float64(nh) - 0.5
+		dstRow := y * dst.Stride
 		for x := 0; x < nw; x++ {
 			sx := (float64(x)+0.5)*float64(w)/float64(nw) - 0.5
-			dst.SetNRGBA(x, y, sampleNRGBABilinear(nrgba, sx, sy))
+			c := sampleNRGBABilinear(nrgba, sx, sy)
+			do := dstRow + x*4
+			dst.Pix[do] = c.R
+			dst.Pix[do+1] = c.G
+			dst.Pix[do+2] = c.B
+			dst.Pix[do+3] = c.A
 		}
 	}
 	return dst
@@ -528,9 +781,15 @@ func EnhanceSignatureInk(src image.Image) *image.NRGBA {
 		up := image.NewNRGBA(image.Rect(0, 0, nw, nh))
 		for y := 0; y < nh; y++ {
 			sy := (float64(y)+0.5)/2.0 - 0.5
+			dstRow := y * up.Stride
 			for x := 0; x < nw; x++ {
 				sx := (float64(x)+0.5)/2.0 - 0.5
-				up.SetNRGBA(x, y, sampleNRGBABilinear(base, sx, sy))
+				c := sampleNRGBABilinear(base, sx, sy)
+				do := dstRow + x*4
+				up.Pix[do] = c.R
+				up.Pix[do+1] = c.G
+				up.Pix[do+2] = c.B
+				up.Pix[do+3] = c.A
 			}
 		}
 		work = up
@@ -538,30 +797,32 @@ func EnhanceSignatureInk(src image.Image) *image.NRGBA {
 
 	w, h := work.Bounds().Dx(), work.Bounds().Dy()
 	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
+	wPix := work.Pix
+	wStride := work.Stride
+
 	for y := 0; y < h; y++ {
+		rowOff := y * wStride
+		dstRow := y * dst.Stride
+		yMin := max(y-1, 0)
+		yMax := min(y+1, h-1)
 		for x := 0; x < w; x++ {
-			c := work.NRGBAAt(x, y)
-			if c.A == 0 {
+			so := rowOff + x*4
+			aByte := wPix[so+3]
+			if aByte == 0 {
 				continue
 			}
-			var sumA float64
-			var count float64
-			for oy := -1; oy <= 1; oy++ {
-				ny := y + oy
-				if ny < 0 || ny >= h {
-					continue
-				}
-				for ox := -1; ox <= 1; ox++ {
-					nx := x + ox
-					if nx < 0 || nx >= w {
-						continue
-					}
-					sumA += float64(work.NRGBAAt(nx, ny).A) / 255.0
-					count++
+			xMin := max(x-1, 0)
+			xMax := min(x+1, w-1)
+			var sumA int
+			count := (yMax - yMin + 1) * (xMax - xMin + 1)
+			for ny := yMin; ny <= yMax; ny++ {
+				nRow := ny * wStride
+				for nx := xMin; nx <= xMax; nx++ {
+					sumA += int(wPix[nRow+nx*4+3])
 				}
 			}
-			avgA := sumA / count
-			a := float64(c.A) / 255.0
+			avgA := float64(sumA) / (float64(count) * 255.0)
+			a := float64(aByte) / 255.0
 			boosted := a + 0.45*(a-avgA)
 			t := min(max((boosted-0.24)/(0.58-0.24), 0), 1)
 			outA := t * t * (3 - 2*t)
@@ -569,7 +830,11 @@ func EnhanceSignatureInk(src image.Image) *image.NRGBA {
 			if alphaByte <= 2 {
 				continue
 			}
-			dst.SetNRGBA(x, y, color.NRGBA{R: c.R, G: c.G, B: c.B, A: alphaByte})
+			do := dstRow + x*4
+			dst.Pix[do] = wPix[so]
+			dst.Pix[do+1] = wPix[so+1]
+			dst.Pix[do+2] = wPix[so+2]
+			dst.Pix[do+3] = alphaByte
 		}
 	}
 	return dst
@@ -585,11 +850,7 @@ func toNRGBA(src image.Image) *image.NRGBA {
 	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
 	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			dst.Set(x, y, src.At(b.Min.X+x, b.Min.Y+y))
-		}
-	}
+	draw.Draw(dst, dst.Bounds(), src, b.Min, draw.Src)
 	return dst
 }
 
@@ -608,24 +869,26 @@ func sampleNRGBABilinear(src *image.NRGBA, x, y float64) color.NRGBA {
 	fx := cx - float64(x0)
 	fy := cy - float64(y0)
 
-	c00 := src.NRGBAAt(b.Min.X+x0, b.Min.Y+y0)
-	c10 := src.NRGBAAt(b.Min.X+x1, b.Min.Y+y0)
-	c01 := src.NRGBAAt(b.Min.X+x0, b.Min.Y+y1)
-	c11 := src.NRGBAAt(b.Min.X+x1, b.Min.Y+y1)
+	pix := src.Pix
+	o00 := src.PixOffset(b.Min.X+x0, b.Min.Y+y0)
+	o10 := src.PixOffset(b.Min.X+x1, b.Min.Y+y0)
+	o01 := src.PixOffset(b.Min.X+x0, b.Min.Y+y1)
+	o11 := src.PixOffset(b.Min.X+x1, b.Min.Y+y1)
 
 	w00 := (1 - fx) * (1 - fy)
 	w10 := fx * (1 - fy)
 	w01 := (1 - fx) * fy
 	w11 := fx * fy
 
-	a00, a10, a01, a11 := float64(c00.A), float64(c10.A), float64(c01.A), float64(c11.A)
+	a00, a10, a01, a11 := float64(pix[o00+3]), float64(pix[o10+3]), float64(pix[o01+3]), float64(pix[o11+3])
 	a := a00*w00 + a10*w10 + a01*w01 + a11*w11
 	if a <= 0.5 {
 		return color.NRGBA{}
 	}
-	r := (float64(c00.R)*a00*w00 + float64(c10.R)*a10*w10 + float64(c01.R)*a01*w01 + float64(c11.R)*a11*w11) / a
-	g := (float64(c00.G)*a00*w00 + float64(c10.G)*a10*w10 + float64(c01.G)*a01*w01 + float64(c11.G)*a11*w11) / a
-	bl := (float64(c00.B)*a00*w00 + float64(c10.B)*a10*w10 + float64(c01.B)*a01*w01 + float64(c11.B)*a11*w11) / a
+	wa00, wa10, wa01, wa11 := a00*w00, a10*w10, a01*w01, a11*w11
+	r := (float64(pix[o00])*wa00 + float64(pix[o10])*wa10 + float64(pix[o01])*wa01 + float64(pix[o11])*wa11) / a
+	g := (float64(pix[o00+1])*wa00 + float64(pix[o10+1])*wa10 + float64(pix[o01+1])*wa01 + float64(pix[o11+1])*wa11) / a
+	bl := (float64(pix[o00+2])*wa00 + float64(pix[o10+2])*wa10 + float64(pix[o01+2])*wa01 + float64(pix[o11+2])*wa11) / a
 	return color.NRGBA{
 		R: uint8(min(max(math.Round(r), 0), 255)),
 		G: uint8(min(max(math.Round(g), 0), 255)),

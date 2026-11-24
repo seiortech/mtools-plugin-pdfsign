@@ -18,6 +18,7 @@ import (
 
 	"github.com/klippa-app/go-pdfium"
 	"github.com/klippa-app/go-pdfium/requests"
+	"github.com/klippa-app/go-pdfium/responses"
 	"github.com/klippa-app/go-pdfium/webassembly"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -25,14 +26,15 @@ import (
 )
 
 const (
-	pdfiumHiDPIFactor = 2.0
-	pdfiumMaxDimPx    = 4096
+	pdfiumHiDPIFactor = defaultHiDPIFactor
+	pdfiumMaxDimPx    = defaultRenderMaxDimPx
 )
 
 var wasmMagic = []byte{0x00, 'a', 's', 'm'}
 
 // PDFiumRenderer renders PDF pages on non-macOS platforms using an external pdfium.wasm module
-// loaded into go-pdfium's wazero WebAssembly runtime.
+// loaded into go-pdfium's wazero WebAssembly runtime. Documents are streamed via FileReader
+// (FPDF_LoadCustomDocument) so large PDFs are never copied into Go heap or WASM linear memory.
 type PDFiumRenderer struct {
 	mu       sync.Mutex
 	cfg      RendererConfig
@@ -41,12 +43,6 @@ type PDFiumRenderer struct {
 	poolErr  error
 	compDir  string
 	fallback *FallbackRenderer
-
-	pdfMu      sync.Mutex
-	pdfPath    string
-	pdfSize    int64
-	pdfModTime int64
-	pdfBytes   []byte
 }
 
 // NewPDFiumRenderer creates a new PDFiumRenderer.
@@ -87,34 +83,30 @@ func (r *PDFiumRenderer) Close() error {
 	return err
 }
 
-func (r *PDFiumRenderer) readPDFBytes(pdfPath string) ([]byte, error) {
-	info, err := os.Stat(pdfPath)
+func openPDFiumStream(instance pdfium.Pdfium, pdfPath string) (*os.File, *responses.OpenDocument, error) {
+	f, err := os.Open(pdfPath)
 	if err != nil {
-		return nil, fmt.Errorf("stat pdf %s: %w", pdfPath, err)
+		return nil, nil, fmt.Errorf("open pdf %s: %w", pdfPath, err)
 	}
-	size := info.Size()
-	modTime := info.ModTime().UnixNano()
-
-	r.pdfMu.Lock()
-	if r.pdfPath == pdfPath && r.pdfSize == size && r.pdfModTime == modTime && r.pdfBytes != nil {
-		data := r.pdfBytes
-		r.pdfMu.Unlock()
-		return data, nil
-	}
-	r.pdfMu.Unlock()
-
-	data, err := os.ReadFile(pdfPath)
+	info, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("read pdf %s: %w", pdfPath, err)
+		_ = f.Close()
+		return nil, nil, fmt.Errorf("stat pdf %s: %w", pdfPath, err)
+	}
+	if info.IsDir() || info.Size() <= 0 {
+		_ = f.Close()
+		return nil, nil, fmt.Errorf("empty or invalid pdf %s", pdfPath)
 	}
 
-	r.pdfMu.Lock()
-	r.pdfPath = pdfPath
-	r.pdfSize = size
-	r.pdfModTime = modTime
-	r.pdfBytes = data
-	r.pdfMu.Unlock()
-	return data, nil
+	doc, err := instance.OpenDocument(&requests.OpenDocument{
+		FileReader:     f,
+		FileReaderSize: info.Size(),
+	})
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, wrapOpenDocErr(pdfPath, err)
+	}
+	return f, doc, nil
 }
 
 // CheckEngine verifies that a preview engine (pdfium.wasm or pdftoppm) is configured
@@ -161,20 +153,17 @@ func (r *PDFiumRenderer) PageCount(ctx context.Context, pdfPath string) (int, er
 	if poolErr != nil {
 		return r.fallback.PageCount(ctx, pdfPath)
 	}
-	pdfBytes, err := r.readPDFBytes(pdfPath)
-	if err != nil {
-		return 0, err
-	}
 	instance, err := pool.GetInstance(30 * time.Second)
 	if err != nil {
 		return 0, fmt.Errorf("acquire pdfium instance: %w", err)
 	}
 	defer instance.Close()
 
-	doc, err := instance.OpenDocument(&requests.OpenDocument{File: &pdfBytes})
+	f, doc, err := openPDFiumStream(instance, pdfPath)
 	if err != nil {
-		return 0, wrapOpenDocErr(pdfPath, err)
+		return 0, err
 	}
+	defer f.Close()
 	defer func() {
 		_, _ = instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: doc.Document})
 	}()
@@ -184,6 +173,57 @@ func (r *PDFiumRenderer) PageCount(ctx context.Context, pdfPath string) (int, er
 		return 0, fmt.Errorf("get page count %s: %w", pdfPath, err)
 	}
 	return resp.PageCount, nil
+}
+
+// AllPageDimensions reads every page's visual dimensions in points in a single document open.
+func (r *PDFiumRenderer) AllPageDimensions(ctx context.Context, pdfPath string) ([]PageDim, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	pool, poolErr := r.ensurePool()
+	if poolErr != nil {
+		return r.fallback.AllPageDimensions(ctx, pdfPath)
+	}
+	instance, err := pool.GetInstance(30 * time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("acquire pdfium instance: %w", err)
+	}
+	defer instance.Close()
+
+	f, doc, err := openPDFiumStream(instance, pdfPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	defer func() {
+		_, _ = instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: doc.Document})
+	}()
+
+	countResp, err := instance.FPDF_GetPageCount(&requests.FPDF_GetPageCount{Document: doc.Document})
+	if err != nil {
+		return nil, fmt.Errorf("get page count %s: %w", pdfPath, err)
+	}
+	if countResp.PageCount <= 0 {
+		return nil, nil
+	}
+	out := make([]PageDim, countResp.PageCount)
+	for i := 0; i < countResp.PageCount; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		sizeResp, err := instance.FPDF_GetPageSizeByIndexF(&requests.FPDF_GetPageSizeByIndexF{
+			Document: doc.Document,
+			Index:    i,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("get page %d dimensions: %w", i+1, err)
+		}
+		out[i] = PageDim{
+			Width:  float64(sizeResp.Size.Width),
+			Height: float64(sizeResp.Size.Height),
+		}
+	}
+	return out, nil
 }
 
 func (r *PDFiumRenderer) PageDimensions(ctx context.Context, pdfPath string, pageNum int) (float64, float64, error) {
@@ -197,20 +237,17 @@ func (r *PDFiumRenderer) PageDimensions(ctx context.Context, pdfPath string, pag
 	if poolErr != nil {
 		return r.fallback.PageDimensions(ctx, pdfPath, pageNum)
 	}
-	pdfBytes, err := r.readPDFBytes(pdfPath)
-	if err != nil {
-		return 0, 0, err
-	}
 	instance, err := pool.GetInstance(30 * time.Second)
 	if err != nil {
 		return 0, 0, fmt.Errorf("acquire pdfium instance: %w", err)
 	}
 	defer instance.Close()
 
-	doc, err := instance.OpenDocument(&requests.OpenDocument{File: &pdfBytes})
+	f, doc, err := openPDFiumStream(instance, pdfPath)
 	if err != nil {
-		return 0, 0, wrapOpenDocErr(pdfPath, err)
+		return 0, 0, err
 	}
+	defer f.Close()
 	defer func() {
 		_, _ = instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: doc.Document})
 	}()
@@ -303,7 +340,6 @@ func (r *PDFiumRenderer) RenderPage(ctx context.Context, pdfPath string, pageNum
 
 	pool, poolErr := r.ensurePool()
 	if poolErr != nil {
-		// On systems with poppler pdftoppm installed, allow it as a secondary fallback.
 		if _, lookErr := exec.LookPath("pdftoppm"); lookErr == nil {
 			return r.fallback.RenderPage(ctx, pdfPath, pageNum, scale)
 		}
@@ -312,24 +348,6 @@ func (r *PDFiumRenderer) RenderPage(ctx context.Context, pdfPath string, pageNum
 
 	if pageNum < 1 {
 		return nil, ErrPageOutOfRange
-	}
-
-	// Compute DPI with 2x HiDPI multiplier, capped to keep bitmap dimensions within pdfiumMaxDimPx.
-	effectiveScale := scale * pdfiumHiDPIFactor
-	if wPt, hPt, dimErr := r.PageDimensions(ctx, pdfPath, pageNum); dimErr == nil && wPt > 0 && hPt > 0 {
-		maxPt := math.Max(wPt, hPt)
-		if maxPt*effectiveScale > pdfiumMaxDimPx {
-			effectiveScale = pdfiumMaxDimPx / maxPt
-		}
-	}
-	dpi := int(math.Round(72.0 * effectiveScale))
-	if dpi < 36 {
-		dpi = 36
-	}
-
-	pdfBytes, err := r.readPDFBytes(pdfPath)
-	if err != nil {
-		return nil, err
 	}
 
 	instance, err := pool.GetInstance(30 * time.Second)
@@ -342,13 +360,28 @@ func (r *PDFiumRenderer) RenderPage(ctx context.Context, pdfPath string, pageNum
 		return nil, err
 	}
 
-	doc, err := instance.OpenDocument(&requests.OpenDocument{File: &pdfBytes})
+	f, doc, err := openPDFiumStream(instance, pdfPath)
 	if err != nil {
-		return nil, wrapOpenDocErr(pdfPath, err)
+		return nil, err
 	}
+	defer f.Close()
 	defer func() {
 		_, _ = instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: doc.Document})
 	}()
+
+	var wPt, hPt float64
+	if sizeResp, dimErr := instance.FPDF_GetPageSizeByIndexF(&requests.FPDF_GetPageSizeByIndexF{
+		Document: doc.Document,
+		Index:    pageNum - 1,
+	}); dimErr == nil {
+		wPt = float64(sizeResp.Size.Width)
+		hPt = float64(sizeResp.Size.Height)
+	}
+	effectiveScale := computeAdaptiveRenderScale(scale, wPt, hPt, pdfiumMaxDimPx, defaultRenderMaxPixels)
+	dpi := int(math.Round(72.0 * effectiveScale))
+	if dpi < 36 {
+		dpi = 36
+	}
 
 	resp, err := instance.RenderPageInDPI(&requests.RenderPageInDPI{
 		Page: requests.Page{
@@ -370,7 +403,6 @@ func (r *PDFiumRenderer) RenderPage(ctx context.Context, pdfPath string, pageNum
 		return nil, fmt.Errorf("render page %d: empty image", pageNum)
 	}
 
-	// Copy pixels into a Go-owned RGBA image before resp.Cleanup() invalidates the WASM buffer.
 	return cloneToRGBA(resp.Result.RenderedImage), nil
 }
 
@@ -380,3 +412,8 @@ func cloneToRGBA(src image.Image) *image.RGBA {
 	draw.Draw(dst, dst.Bounds(), src, bounds.Min, draw.Src)
 	return dst
 }
+
+var (
+	_ PageRenderer           = (*PDFiumRenderer)(nil)
+	_ BatchDimensionRenderer = (*PDFiumRenderer)(nil)
+)

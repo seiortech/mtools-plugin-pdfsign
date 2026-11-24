@@ -47,9 +47,9 @@
           "id": "default_output_dir",
           "kind": "directory",
           "label": "Default Output Folder",
-          "description": "Destination folder for signed PDF files.",
-          "default": "~/Downloads",
-          "required": true
+          "description": "Optional destination folder for signed PDF files. Leave empty to default to the input PDF's folder.",
+          "default": "",
+          "required": false
         },
         {
           "id": "pdfium_wasm_path",

@@ -150,3 +150,145 @@ func TestEnhanceSignatureInk(t *testing.T) {
 		t.Fatalf("expected core ink alpha solidified >=230, got %d", core)
 	}
 }
+
+func TestRenderPlacementStraightAlphaNoDarkHalo(t *testing.T) {
+	// Straight-alpha semi-transparent pixel: RGB=(200, 100, 50), A=128.
+	nrgba := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	nrgba.SetNRGBA(1, 1, color.NRGBA{R: 200, G: 100, B: 50, A: 128})
+
+	outNRGBA := pdfsign.RenderPlacementImage(nrgba, pdfsign.DefaultPlacementRenderOptions())
+	p1 := outNRGBA.NRGBAAt(1, 1)
+	if p1.R != 200 || p1.G != 100 || p1.B != 50 || p1.A != 128 {
+		t.Fatalf("NRGBA straight alpha corrupted: got %+v, want {200 100 50 128}", p1)
+	}
+
+	// Premultiplied RGBA representation of RGB=(200, 100, 50), A=128 -> (100, 50, 25, 128).
+	rgba := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	rgba.SetRGBA(1, 1, color.RGBA{R: 100, G: 50, B: 25, A: 128})
+	outRGBA := pdfsign.RenderPlacementImage(rgba, pdfsign.DefaultPlacementRenderOptions())
+	p2 := outRGBA.NRGBAAt(1, 1)
+	if p2.R < 195 || p2.R > 205 || p2.G < 95 || p2.G > 105 || p2.B < 45 || p2.B > 55 || p2.A != 128 {
+		t.Fatalf("RGBA un-premultiplication darkened edge: got %+v, want ~{200 100 50 128}", p2)
+	}
+}
+
+func TestRenderPlacementExactOrthogonalRotations(t *testing.T) {
+	// 4x2 asymmetric image with distinct corner pixels.
+	src := image.NewNRGBA(image.Rect(0, 0, 4, 2))
+	tl := color.NRGBA{R: 255, G: 0, B: 0, A: 255}
+	tr := color.NRGBA{R: 0, G: 255, B: 0, A: 255}
+	br := color.NRGBA{R: 0, G: 0, B: 255, A: 255}
+	bl := color.NRGBA{R: 255, G: 255, B: 0, A: 255}
+	src.SetNRGBA(0, 0, tl)
+	src.SetNRGBA(3, 0, tr)
+	src.SetNRGBA(3, 1, br)
+	src.SetNRGBA(0, 1, bl)
+
+	r90 := pdfsign.RenderPlacementImage(src, pdfsign.PlacementRenderOptions{
+		Crop: pdfsign.DefaultNormalizedRect(), RotationDeg: 90, Opacity: 1.0,
+	})
+	if r90.Bounds().Dx() != 2 || r90.Bounds().Dy() != 4 {
+		t.Fatalf("90deg bounds = %v, want 2x4", r90.Bounds())
+	}
+	if r90.NRGBAAt(1, 0) != tl || r90.NRGBAAt(1, 3) != tr || r90.NRGBAAt(0, 3) != br || r90.NRGBAAt(0, 0) != bl {
+		t.Fatalf("90deg corners mismatch: TR=%v BR=%v BL=%v TL=%v",
+			r90.NRGBAAt(1, 0), r90.NRGBAAt(1, 3), r90.NRGBAAt(0, 3), r90.NRGBAAt(0, 0))
+	}
+
+	r180 := pdfsign.RenderPlacementImage(src, pdfsign.PlacementRenderOptions{
+		Crop: pdfsign.DefaultNormalizedRect(), RotationDeg: 180, Opacity: 1.0,
+	})
+	if r180.NRGBAAt(3, 1) != tl || r180.NRGBAAt(0, 1) != tr || r180.NRGBAAt(0, 0) != br || r180.NRGBAAt(3, 0) != bl {
+		t.Fatalf("180deg corners mismatch")
+	}
+
+	r270 := pdfsign.RenderPlacementImage(src, pdfsign.PlacementRenderOptions{
+		Crop: pdfsign.DefaultNormalizedRect(), RotationDeg: 270, Opacity: 1.0,
+	})
+	if r270.Bounds().Dx() != 2 || r270.Bounds().Dy() != 4 {
+		t.Fatalf("270deg bounds = %v, want 2x4", r270.Bounds())
+	}
+	if r270.NRGBAAt(0, 3) != tl || r270.NRGBAAt(0, 0) != tr || r270.NRGBAAt(1, 0) != br || r270.NRGBAAt(1, 3) != bl {
+		t.Fatalf("270deg corners mismatch")
+	}
+}
+
+func TestRenderStrokeOntoMatchesFullRender(t *testing.T) {
+	strokes := []pdfsign.Stroke{
+		{Points: []pdfsign.Point{{X: 10, Y: 10}, {X: 80, Y: 40}}, Width: 4, Color: color.RGBA{R: 20, G: 50, B: 180, A: 255}},
+		{Points: []pdfsign.Point{{X: 40, Y: 20}, {X: 50, Y: 30}}, Width: 8, Eraser: true},
+	}
+	full := pdfsign.RenderStrokesToImage(120, 60, strokes)
+	inc := image.NewNRGBA(image.Rect(0, 0, 120, 60))
+	for _, s := range strokes {
+		pdfsign.RenderStrokeOnto(inc, s)
+	}
+	if len(full.Pix) != len(inc.Pix) {
+		t.Fatalf("pixel length mismatch")
+	}
+	for i := range full.Pix {
+		if full.Pix[i] != inc.Pix[i] {
+			t.Fatalf("incremental stroke diverged at byte %d: got %d want %d", i, inc.Pix[i], full.Pix[i])
+		}
+	}
+}
+
+func BenchmarkRemoveBackgroundNRGBA(b *testing.B) {
+	src := image.NewNRGBA(image.Rect(0, 0, 1024, 768))
+	for y := 0; y < 768; y++ {
+		for x := 0; x < 1024; x++ {
+			if (x+y)%17 == 0 {
+				src.SetNRGBA(x, y, color.NRGBA{R: 25, G: 30, B: 35, A: 255})
+			} else {
+				src.SetNRGBA(x, y, color.NRGBA{R: 245, G: 244, B: 240, A: 255})
+			}
+		}
+	}
+	opts := pdfsign.DefaultPhotoProcessOptions()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = pdfsign.RemoveBackground(src, opts)
+	}
+}
+
+func BenchmarkRemoveBackgroundYCbCr(b *testing.B) {
+	src := image.NewYCbCr(image.Rect(0, 0, 1024, 768), image.YCbCrSubsampleRatio420)
+	for i := range src.Y {
+		if i%17 == 0 {
+			src.Y[i] = 30
+		} else {
+			src.Y[i] = 245
+		}
+	}
+	opts := pdfsign.DefaultPhotoProcessOptions()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = pdfsign.RemoveBackground(src, opts)
+	}
+}
+
+func BenchmarkEnhanceSignatureInk(b *testing.B) {
+	src := image.NewNRGBA(image.Rect(0, 0, 400, 200))
+	for y := 60; y < 140; y++ {
+		for x := 40; x < 360; x++ {
+			src.SetNRGBA(x, y, color.NRGBA{R: 20, G: 20, B: 20, A: 180})
+		}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = pdfsign.EnhanceSignatureInk(src)
+	}
+}
+
+func BenchmarkRenderPlacementRotate90(b *testing.B) {
+	src := image.NewNRGBA(image.Rect(0, 0, 1024, 512))
+	opts := pdfsign.PlacementRenderOptions{
+		Crop:        pdfsign.DefaultNormalizedRect(),
+		RotationDeg: 90,
+		Opacity:     0.9,
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = pdfsign.RenderPlacementImage(src, opts)
+	}
+}

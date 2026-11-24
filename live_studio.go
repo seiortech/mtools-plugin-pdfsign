@@ -11,6 +11,12 @@ import (
 
 	"github.com/seiortech/mtools-plugin-pdfsign/internal/pdfsign"
 	"github.com/seiortech/mtools-sdk/pluginapi"
+	_ "golang.org/x/image/webp"
+)
+
+const (
+	maxStudioDecodePixels = 64_000_000
+	maxStudioRawPhotoDim  = 2048
 )
 
 func (s *pdfSignServer) openStudioLocked(mode int, sess *pluginapi.UISession) {
@@ -21,13 +27,39 @@ func (s *pdfSignServer) openStudioLocked(mode int, sess *pluginapi.UISession) {
 	}
 }
 
+func (s *pdfSignServer) closeStudioLocked(sess *pluginapi.UISession) {
+	s.studio.open = false
+	if s.studio.photoDebounce != nil {
+		s.studio.photoDebounce.Stop()
+		s.studio.photoDebounce = nil
+	}
+	s.studio.photoGen++
+	s.studio.rawPhoto = nil
+	s.studio.photoThumb = nil
+	s.studio.photoResult = nil
+	s.studio.photoPath = ""
+	s.studio.drawCanvas = nil
+	if sess != nil && sess.AssetsDir() != "" {
+		if s.studio.photoPreviewFile != "" {
+			_ = os.Remove(filepath.Join(sess.AssetsDir(), s.studio.photoPreviewFile))
+		}
+		if s.studio.drawPreviewFile != "" {
+			_ = os.Remove(filepath.Join(sess.AssetsDir(), s.studio.drawPreviewFile))
+		}
+	}
+	s.studio.photoPreviewFile = ""
+	s.studio.photoPreviewRef = ""
+	s.studio.drawPreviewFile = ""
+	s.studio.drawPreviewRef = ""
+}
+
 func (s *pdfSignServer) handleStudioClickLocked(nodeID string, sess *pluginapi.UISession) bool {
 	if !s.studio.open {
 		return false
 	}
 	switch nodeID {
 	case "studio_cancel":
-		s.studio.open = false
+		s.closeStudioLocked(sess)
 		return true
 	case "studio_swatch_black":
 		s.studio.inkIdx = 0
@@ -47,6 +79,7 @@ func (s *pdfSignServer) handleStudioClickLocked(nodeID string, sess *pluginapi.U
 	case "studio_undo":
 		if len(s.studio.strokes) > 0 {
 			s.studio.strokes = s.studio.strokes[:len(s.studio.strokes)-1]
+			s.studio.drawCanvas = nil
 			s.refreshDrawPreviewLocked(sess)
 			return true
 		}
@@ -54,6 +87,7 @@ func (s *pdfSignServer) handleStudioClickLocked(nodeID string, sess *pluginapi.U
 	case "studio_clear":
 		if len(s.studio.strokes) > 0 {
 			s.studio.strokes = nil
+			s.studio.drawCanvas = nil
 			s.refreshDrawPreviewLocked(sess)
 			return true
 		}
@@ -82,14 +116,27 @@ func (s *pdfSignServer) handleStudioClickLocked(nodeID string, sess *pluginapi.U
 	return false
 }
 
+func (s *pdfSignServer) appendDrawStrokePreviewLocked(stroke pdfsign.Stroke, sess *pluginapi.UISession) {
+	if s.studio.drawCanvas == nil {
+		s.studio.drawCanvas = pdfsign.RenderStrokesToImage(studioCanvasW, studioCanvasH, s.studio.strokes)
+	} else {
+		pdfsign.RenderStrokeOnto(s.studio.drawCanvas, stroke)
+	}
+	s.publishDrawCanvasLocked(sess)
+}
+
 func (s *pdfSignServer) refreshDrawPreviewLocked(sess *pluginapi.UISession) {
-	if sess == nil {
+	s.studio.drawCanvas = pdfsign.RenderStrokesToImage(studioCanvasW, studioCanvasH, s.studio.strokes)
+	s.publishDrawCanvasLocked(sess)
+}
+
+func (s *pdfSignServer) publishDrawCanvasLocked(sess *pluginapi.UISession) {
+	if sess == nil || sess.AssetsDir() == "" || s.studio.drawCanvas == nil {
 		return
 	}
-	img := pdfsign.RenderStrokesToImage(studioCanvasW, studioCanvasH, s.studio.strokes)
 	s.studio.drawSeq++
 	fileName := fmt.Sprintf("studio-draw-%d.png", s.studio.drawSeq)
-	if err := writeAssetPNG(sess.AssetsDir(), fileName, img); err != nil {
+	if err := writeAssetPNG(sess.AssetsDir(), fileName, s.studio.drawCanvas); err != nil {
 		return
 	}
 	if s.studio.drawPreviewFile != "" {
@@ -101,6 +148,22 @@ func (s *pdfSignServer) refreshDrawPreviewLocked(sess *pluginapi.UISession) {
 
 func (s *pdfSignServer) loadStudioPhotoLocked(photoPath string, sess *pluginapi.UISession) {
 	s.errMsg = ""
+	cfgFile, err := os.Open(photoPath)
+	if err != nil {
+		s.errMsg = fmt.Sprintf("Failed to open image: %v", err)
+		return
+	}
+	cfg, _, cfgErr := image.DecodeConfig(cfgFile)
+	_ = cfgFile.Close()
+	if cfgErr != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		s.errMsg = fmt.Sprintf("Unsupported image file: %v", cfgErr)
+		return
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > maxStudioDecodePixels {
+		s.errMsg = "Image is too large (exceeds 64 megapixels)."
+		return
+	}
+
 	f, err := os.Open(photoPath)
 	if err != nil {
 		s.errMsg = fmt.Sprintf("Failed to open image: %v", err)
@@ -112,9 +175,11 @@ func (s *pdfSignServer) loadStudioPhotoLocked(photoPath string, sess *pluginapi.
 		s.errMsg = fmt.Sprintf("Unsupported image file: %v", err)
 		return
 	}
+	// Bound retained photo resolution to 2048px (>600 DPI for signature width) so memory stays bounded.
+	bounded := pdfsign.DownscaleToMaxDim(img, maxStudioRawPhotoDim)
 	s.studio.photoPath = photoPath
-	s.studio.rawPhoto = img
-	s.studio.photoThumb = pdfsign.DownscaleToMaxDim(img, 1024)
+	s.studio.rawPhoto = bounded
+	s.studio.photoThumb = pdfsign.DownscaleToMaxDim(bounded, 1024)
 	s.studio.mode = studioModePhoto
 	s.recomputePhotoPreviewLocked(sess)
 }
@@ -130,17 +195,58 @@ func (s *pdfSignServer) schedulePhotoPreviewLocked(sess *pluginapi.UISession) {
 	gen := s.studio.photoGen
 	s.studio.photoDebounce = time.AfterFunc(40*time.Millisecond, func() {
 		s.mu.Lock()
-		if s.studio.photoGen != gen || s.studio.rawPhoto == nil {
+		if s.studio.photoGen != gen || !s.studio.open || s.studio.rawPhoto == nil {
 			s.mu.Unlock()
 			return
 		}
-		s.recomputePhotoPreviewLocked(sess)
-		tree := s.buildTreeLocked()
+		src := s.studio.photoThumb
+		if src == nil {
+			src = s.studio.rawPhoto
+		}
+		opts := pdfsign.PhotoProcessOptions{
+			Threshold:  s.studio.threshold,
+			Contrast:   s.studio.contrast,
+			InkMode:    s.studio.photoInk,
+			Crop:       pdfsign.DefaultNormalizedRect(),
+			EnhanceInk: s.studio.photoCrisp,
+		}
+		assetsDir := ""
+		if sess != nil {
+			assetsDir = sess.AssetsDir()
+		}
+		s.studio.photoSeq++
+		fileName := fmt.Sprintf("studio-photo-%d.png", s.studio.photoSeq)
 		s.mu.Unlock()
 
-		if sess != nil {
-			_ = sess.Render(tree)
+		// Run background removal, trimming, fast PNG encode, and temp write completely off s.mu.
+		res := pdfsign.AutoTrimAlphaBounds(pdfsign.RemoveBackground(src, opts), 8)
+		var wroteFile bool
+		if assetsDir != "" {
+			if err := writeAssetPNG(assetsDir, fileName, res); err == nil {
+				wroteFile = true
+			}
 		}
+
+		s.mu.Lock()
+		if s.studio.photoGen != gen || !s.studio.open || s.studio.rawPhoto == nil {
+			s.mu.Unlock()
+			if wroteFile && assetsDir != "" {
+				_ = os.Remove(filepath.Join(assetsDir, fileName))
+			}
+			return
+		}
+		s.studio.photoResult = res
+		if wroteFile {
+			if s.studio.photoPreviewFile != "" && assetsDir != "" {
+				_ = os.Remove(filepath.Join(assetsDir, s.studio.photoPreviewFile))
+			}
+			s.studio.photoPreviewFile = fileName
+			s.studio.photoPreviewRef = "asset:" + fileName
+		}
+		s.mu.Unlock()
+
+		// Serialize tree push via renderAndSend (acquires s.renderMu) to prevent out-of-order Rev races.
+		_ = s.renderAndSend(sess)
 	})
 }
 
@@ -148,6 +254,7 @@ func (s *pdfSignServer) recomputePhotoPreviewLocked(sess *pluginapi.UISession) {
 	if s.studio.rawPhoto == nil {
 		return
 	}
+	s.studio.photoGen++
 	src := s.studio.photoThumb
 	if src == nil {
 		src = s.studio.rawPhoto
@@ -161,7 +268,7 @@ func (s *pdfSignServer) recomputePhotoPreviewLocked(sess *pluginapi.UISession) {
 	}
 	res := pdfsign.AutoTrimAlphaBounds(pdfsign.RemoveBackground(src, opts), 8)
 	s.studio.photoResult = res
-	if sess == nil {
+	if sess == nil || sess.AssetsDir() == "" {
 		return
 	}
 	s.studio.photoSeq++
@@ -201,7 +308,10 @@ func (s *pdfSignServer) buildFinalStudioImageLocked() (*image.NRGBA, string) {
 	if len(s.studio.strokes) == 0 {
 		return nil, ""
 	}
-	raw := pdfsign.RenderStrokesToImage(studioCanvasW, studioCanvasH, s.studio.strokes)
+	raw := s.studio.drawCanvas
+	if raw == nil {
+		raw = pdfsign.RenderStrokesToImage(studioCanvasW, studioCanvasH, s.studio.strokes)
+	}
 	trimmed := pdfsign.AutoTrimAlphaBounds(raw, 8)
 	return trimmed, "drawn"
 }
@@ -237,12 +347,9 @@ func (s *pdfSignServer) commitStudioLocked(saveToVault, placeOnPage bool, sess *
 		s.placeSignatureAtLocked(img, sourceID, s.currentPage, x, y, sess)
 	}
 
-	// Reset studio draft after commit.
-	s.studio.open = false
-	if s.studio.mode == studioModeDraw {
-		s.studio.strokes = nil
-		s.refreshDrawPreviewLocked(sess)
-	}
+	// Reset studio draft and release decoded photo & canvas memory after commit.
+	s.studio.strokes = nil
+	s.closeStudioLocked(sess)
 	return true
 }
 

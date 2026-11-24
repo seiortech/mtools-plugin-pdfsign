@@ -37,6 +37,7 @@ type SignatureVault struct {
 	dir     string
 	items   []SignatureItem
 	fileMap map[string]string // id -> png path
+	nextSeq uint64
 }
 
 func NewSignatureVault(dataDir string) *SignatureVault {
@@ -151,7 +152,8 @@ func (v *SignatureVault) Save(name string, sourceKind string, width, height int,
 		return SignatureItem{}, ErrVaultFull
 	}
 
-	id := fmt.Sprintf("sig_%d", time.Now().UnixNano())
+	v.nextSeq++
+	id := fmt.Sprintf("sig_%d_%d", time.Now().UnixNano(), v.nextSeq)
 	if name == "" {
 		name = fmt.Sprintf("Signature %d", len(v.items)+1)
 	}

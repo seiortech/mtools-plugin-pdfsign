@@ -57,7 +57,6 @@ func (s *pdfSignServer) buildEmptyTreeLocked() pluginapi.UINode {
 			}),
 		})
 	}
-	// Work around empty picker using a dedicated UIEventChange target ID matches empty_open_pdf / empty_card.
 	children[0].ID = "empty_open_pdf"
 	return pluginapi.UINode{
 		ID:   "empty_root",
@@ -119,8 +118,16 @@ func (s *pdfSignServer) buildWorkbenchTreeLocked() pluginapi.UINode {
 	}
 }
 
+func (s *pdfSignServer) defaultSignedOutputPathLocked() string {
+	base := strings.TrimSuffix(filepath.Base(s.pdfPath), filepath.Ext(s.pdfPath)) + "-signed.pdf"
+	if s.defaultOutputDir != "" {
+		return filepath.Join(s.defaultOutputDir, base)
+	}
+	return filepath.Join(filepath.Dir(s.pdfPath), base)
+}
+
 func (s *pdfSignServer) buildTopBarNodeLocked() pluginapi.UINode {
-	defaultOut := strings.TrimSuffix(s.pdfPath, filepath.Ext(s.pdfPath)) + "-signed.pdf"
+	defaultOut := s.defaultSignedOutputPathLocked()
 	addVariant := "secondary"
 	if s.vault != nil && s.vault.Count() == 0 {
 		addVariant = "primary"
@@ -372,47 +379,82 @@ func (s *pdfSignServer) buildTopBarNodeLocked() pluginapi.UINode {
 	}
 }
 
+func appendChunkedSpacers(out []pluginapi.UINode, prefix string, totalH, width, pageGap int) []pluginapi.UINode {
+	if totalH <= 0 {
+		return out
+	}
+	const maxChunkH = 8000
+	width = min(max(width, 100), 8192)
+	rem := totalH
+	idx := 0
+	for rem > 0 {
+		var chunkH int
+		if rem <= maxChunkH {
+			chunkH = rem
+			rem = 0
+		} else {
+			chunkH = min(maxChunkH, rem-pageGap-1)
+			if chunkH < 1 {
+				chunkH = 1
+			}
+			rem -= chunkH + pageGap
+		}
+		out = append(out, pluginapi.UINode{
+			ID:   fmt.Sprintf("%s-%d", prefix, idx),
+			Kind: pluginapi.UINodeColumn,
+			Props: mustProps(pluginapi.UIContainerProps{
+				Width:       width,
+				Height:      chunkH,
+				NoFillWidth: true,
+			}),
+		})
+		idx++
+	}
+	return out
+}
+
 func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
+	const pageGap = 24
 	z := s.effectiveZoomLocked()
-	pageNodes := make([]pluginapi.UINode, 0, s.pageCount)
+	total := s.pageCount
+	winStart := max(s.currentPage-4, 1)
+	winEnd := min(s.currentPage+4, total)
 
-	for p := 1; p <= s.pageCount; p++ {
+	aboveH, aboveW := 0, 0
+	for p := 1; p < winStart; p++ {
 		dims := s.pageDimsAtLocked(p)
-		pw := int(math.Round(dims.W * z))
-		ph := int(math.Round(dims.H * z))
-		if pw < 100 {
-			pw = 100
+		pw := min(max(int(math.Round(dims.W*z)), 100), 8192)
+		ph := min(max(int(math.Round(dims.H*z)), 100), 8192)
+		if pw > aboveW {
+			aboveW = pw
 		}
-		if ph < 100 {
-			ph = 100
+		if aboveH > 0 {
+			aboveH += pageGap
 		}
+		aboveH += ph
+	}
 
-		if absInt(p-s.currentPage) > 4 {
-			pageNodes = append(pageNodes, pluginapi.UINode{
-				ID:   fmt.Sprintf("page-spacer-%d", p),
-				Kind: pluginapi.UINodeColumn,
-				Props: mustProps(pluginapi.UIContainerProps{
-					Width:       pw,
-					Height:      ph,
-					Surface:     "paper",
-					BorderSize:  1,
-					NoFillWidth: true,
-					Justify:     "center",
-					Align:       "center",
-				}),
-				Children: []pluginapi.UINode{
-					{
-						ID:   fmt.Sprintf("page-spacer-lbl-%d", p),
-						Kind: pluginapi.UINodeText,
-						Props: mustProps(pluginapi.UITextProps{
-							Text:    fmt.Sprintf("Page %d", p),
-							Variant: "muted",
-						}),
-					},
-				},
-			})
-			continue
+	belowH, belowW := 0, 0
+	for p := winEnd + 1; p <= total; p++ {
+		dims := s.pageDimsAtLocked(p)
+		pw := min(max(int(math.Round(dims.W*z)), 100), 8192)
+		ph := min(max(int(math.Round(dims.H*z)), 100), 8192)
+		if pw > belowW {
+			belowW = pw
 		}
+		if belowH > 0 {
+			belowH += pageGap
+		}
+		belowH += ph
+	}
+
+	pageNodes := make([]pluginapi.UINode, 0, max(winEnd-winStart+1, 0)+16)
+	pageNodes = appendChunkedSpacers(pageNodes, "page-spacer-above", aboveH, aboveW, pageGap)
+
+	for p := winStart; p <= winEnd && p <= total; p++ {
+		dims := s.pageDimsAtLocked(p)
+		pw := min(max(int(math.Round(dims.W*z)), 100), 8192)
+		ph := min(max(int(math.Round(dims.H*z)), 100), 8192)
 
 		assetRef := s.pageAssetRefLocked(p)
 		canvasChildren := make([]pluginapi.UINode, 0, 4)
@@ -422,10 +464,10 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 			if pl.Page != p {
 				continue
 			}
-			px := pl.X * z
-			py := pl.Y * z
-			w := max(int(math.Round(pl.Width*z)), 24)
-			h := max(int(math.Round(pl.Height*z)), 16)
+			px := min(max(pl.X*z, -8192), 8192)
+			py := min(max(pl.Y*z, -8192), 8192)
+			w := min(max(int(math.Round(pl.Width*z)), 24), 8192)
+			h := min(max(int(math.Round(pl.Height*z)), 16), 8192)
 			aspect := pl.Width / max(pl.Height, 1)
 			imgRef := s.placedAssets[pl.ID]
 
@@ -475,7 +517,6 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 			canvasChildren = append(canvasChildren, s.buildCanvasPlacementBarLocked(*activePlaced, z, pw, ph))
 		}
 
-		// Bottom-right page tag overlay (matches HEAD:pdfsign/view.go renderPageInScrollStack)
 		rightVal := 8.0
 		bottomVal := 8.0
 		canvasChildren = append(canvasChildren, pluginapi.UINode{
@@ -557,6 +598,9 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 		})
 	}
 
+	pageNodes = appendChunkedSpacers(pageNodes, "page-spacer-below", belowH, belowW, pageGap)
+
+	scrollY := min(max(s.targetScrollY, 0), maxScrollTargetY)
 	viewportNode := pluginapi.UINode{
 		ID:   "viewport",
 		Kind: pluginapi.UINodeScroll,
@@ -564,7 +608,7 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 			Fill:        true,
 			Grow:        true,
 			Padding:     24,
-			Gap:         24,
+			Gap:         pageGap,
 			Align:       "center",
 			Justify:     "center",
 			Surface:     "ground",
@@ -572,7 +616,7 @@ func (s *pdfSignServer) buildViewportStackLocked() pluginapi.UINode {
 			TrackScroll: true,
 			Clickable:   true,
 			ScrollTarget: &pluginapi.UIScrollTarget{
-				Y:      s.targetScrollY,
+				Y:      scrollY,
 				Seq:    s.scrollSeq,
 				Smooth: s.scrollSeq > 1,
 			},
@@ -890,6 +934,11 @@ func (s *pdfSignServer) buildRightPanelLocked() pluginapi.UINode {
 
 func (s *pdfSignServer) buildExportBannerLocked() *pluginapi.UINode {
 	if s.exporting {
+		label := s.exportProgressMsg
+		if label == "" {
+			label = "Signing PDF..."
+		}
+		done := min(max(s.exportProgress, 0), 100)
 		node := pluginapi.UINode{
 			ID:   "export_banner_busy",
 			Kind: pluginapi.UINodeColumn,
@@ -904,9 +953,18 @@ func (s *pdfSignServer) buildExportBannerLocked() *pluginapi.UINode {
 					ID:   "export_prog",
 					Kind: pluginapi.UINodeProgress,
 					Props: mustProps(pluginapi.UIProgressProps{
-						Done:  50,
+						Done:  done,
 						Total: 100,
-						Label: "Signing PDF...",
+						Label: label,
+					}),
+				},
+				{
+					ID:   "cancel_export",
+					Kind: pluginapi.UINodeButton,
+					Props: mustProps(pluginapi.UIButtonProps{
+						Label:   s.T("pdfsign.btn_cancel"),
+						Variant: "danger",
+						Height:  28,
 					}),
 				},
 			},
@@ -1263,6 +1321,7 @@ func (s *pdfSignServer) buildActiveInspectorLocked() *pluginapi.UINode {
 							Label:    s.T("pdfsign.ink_original"),
 							Variant:  "secondary",
 							Selected: active.InkMode == pdfsign.InkOriginal,
+							Disabled: active.Locked,
 							Height:   28,
 						}),
 					},
@@ -1273,6 +1332,7 @@ func (s *pdfSignServer) buildActiveInspectorLocked() *pluginapi.UINode {
 							Label:    s.T("pdfsign.ink_black"),
 							Variant:  "secondary",
 							Selected: active.InkMode == pdfsign.InkBlack,
+							Disabled: active.Locked,
 							Height:   28,
 						}),
 					},
@@ -1283,6 +1343,7 @@ func (s *pdfSignServer) buildActiveInspectorLocked() *pluginapi.UINode {
 							Label:    s.T("pdfsign.ink_blue"),
 							Variant:  "secondary",
 							Selected: active.InkMode == pdfsign.InkBlue,
+							Disabled: active.Locked,
 							Height:   28,
 						}),
 					},
@@ -1313,6 +1374,7 @@ func (s *pdfSignServer) buildActiveInspectorLocked() *pluginapi.UINode {
 							Label:    s.T("pdfsign.crisp_ink"),
 							Variant:  "secondary",
 							Selected: active.Crisp,
+							Disabled: active.Locked,
 							Height:   28,
 						}),
 					},
@@ -1320,9 +1382,10 @@ func (s *pdfSignServer) buildActiveInspectorLocked() *pluginapi.UINode {
 						ID:   "insp_rot_right",
 						Kind: pluginapi.UINodeButton,
 						Props: mustProps(pluginapi.UIButtonProps{
-							Label:   s.T("pdfsign.rotate_right"),
-							Variant: "secondary",
-							Height:  28,
+							Label:    s.T("pdfsign.rotate_right"),
+							Variant:  "secondary",
+							Disabled: active.Locked,
+							Height:   28,
 						}),
 					},
 					{
@@ -1338,9 +1401,10 @@ func (s *pdfSignServer) buildActiveInspectorLocked() *pluginapi.UINode {
 						ID:   "insp_del",
 						Kind: pluginapi.UINodeButton,
 						Props: mustProps(pluginapi.UIButtonProps{
-							Label:   s.T("pdfsign.delete"),
-							Variant: "danger",
-							Height:  28,
+							Label:    s.T("pdfsign.delete"),
+							Variant:  "danger",
+							Disabled: active.Locked,
+							Height:   28,
 						}),
 					},
 				},
@@ -1350,10 +1414,45 @@ func (s *pdfSignServer) buildActiveInspectorLocked() *pluginapi.UINode {
 	return &node
 }
 
+func quickJumpPageNumbers(current, total, maxChips int) []int {
+	if total <= 0 || maxChips <= 0 {
+		return nil
+	}
+	if total <= maxChips {
+		pages := make([]int, total)
+		for i := range pages {
+			pages[i] = i + 1
+		}
+		return pages
+	}
+	if current < 1 {
+		current = 1
+	} else if current > total {
+		current = total
+	}
+	midSlots := maxChips - 2
+	start := current - midSlots/2
+	if start < 2 {
+		start = 2
+	}
+	end := start + midSlots - 1
+	if end > total-1 {
+		end = total - 1
+		start = max(2, end-midSlots+1)
+	}
+	pages := make([]int, 0, maxChips)
+	pages = append(pages, 1)
+	for p := start; p <= end; p++ {
+		pages = append(pages, p)
+	}
+	pages = append(pages, total)
+	return pages
+}
+
 func (s *pdfSignServer) buildPageJumpSectionLocked() pluginapi.UINode {
-	chips := make([]pluginapi.UINode, 0, min(s.pageCount, 24))
-	limit := min(s.pageCount, 24)
-	for p := 1; p <= limit; p++ {
+	pages := quickJumpPageNumbers(s.currentPage, s.pageCount, 24)
+	chips := make([]pluginapi.UINode, 0, len(pages))
+	for _, p := range pages {
 		chips = append(chips, pluginapi.UINode{
 			ID:   fmt.Sprintf("rail_page_%d", p),
 			Kind: pluginapi.UINodeButton,

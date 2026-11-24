@@ -3,6 +3,7 @@ package pdfsign
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"image"
@@ -10,6 +11,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"sort"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
@@ -18,36 +21,28 @@ import (
 )
 
 var (
-	ErrEmptyInput       = errors.New("no input or output path specified")
-	ErrNoSignatures     = errors.New("no signature placements provided")
-	ErrInvalidPageNum   = errors.New("signature placed on invalid page number")
+	ErrEmptyInput        = errors.New("no input or output path specified")
+	ErrNoSignatures      = errors.New("no signature placements provided")
+	ErrInvalidPageNum    = errors.New("signature placed on invalid page number")
 	ErrZeroSizeSignature = errors.New("signature dimensions must be greater than zero")
 )
 
 // PlacedSignature defines a signature positioned on a specific PDF page.
 type PlacedSignature struct {
-	ID        string          // Unique placement ID
-	SourceID  string          // Vault signature ID (if from vault)
-	Page      int             // 1-based PDF page number
-	X         float64         // X position in PDF points from top-left
-	Y         float64         // Y position in PDF points from top-left
-	Width     float64         // Width in PDF points
-	Height    float64         // Height in PDF points
-	Rotation  float64         // Rotation in degrees (0, 90, 180, 270)
-	Opacity   float64         // Opacity: 0.0 to 1.0 (defaults to 1.0)
-	Crop      NormalizedRect  // Optional sub-crop [0..1]
-	InkMode   InkColorMode    // Ink recoloring (InkOriginal, InkBlack, InkBlue, InkRed)
-	Image     image.Image     // Source raster image
-	Locked    bool            // If true, placement cannot be moved, resized, rotated, or deleted
-	Crisp     bool            // If true, applies EnhanceSignatureInk for sharper edges and smooth lines
-
-	// Cached rendered image & bitmap
-	cachedRot   float64
-	cachedOp    float64
-	cachedInk   InkColorMode
-	cachedCrop  NormalizedRect
-	cachedImg   image.Image
-	cachedBmp   any // *ui.Bitmap stored as any to avoid import cycles
+	ID       string         // Unique placement ID
+	SourceID string         // Vault signature ID (if from vault)
+	Page     int            // 1-based PDF page number
+	X        float64        // X position in PDF points from top-left
+	Y        float64        // Y position in PDF points from top-left
+	Width    float64        // Width in PDF points
+	Height   float64        // Height in PDF points
+	Rotation float64        // Rotation in degrees (0, 90, 180, 270)
+	Opacity  float64        // Opacity: 0.0 to 1.0 (defaults to 1.0)
+	Crop     NormalizedRect // Optional sub-crop [0..1]
+	InkMode  InkColorMode   // Ink recoloring (InkOriginal, InkBlack, InkBlue, InkRed)
+	Image    image.Image    // Source raster image
+	Locked   bool           // If true, placement cannot be moved, resized, rotated, or deleted
+	Crisp    bool           // If true, applies EnhanceSignatureInk for sharper edges and smooth lines
 }
 
 // SignRequest contains all parameters required to sign a PDF.
@@ -57,7 +52,31 @@ type SignRequest struct {
 	Signatures []PlacedSignature
 }
 
+func replaceFileAtomic(src, dst string) error {
+	err := os.Rename(src, dst)
+	if err == nil {
+		return nil
+	}
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(dst)
+		return os.Rename(src, dst)
+	}
+	return err
+}
+
+func imageIdentityPtr(img image.Image) (uintptr, bool) {
+	if img == nil {
+		return 0, false
+	}
+	v := reflect.ValueOf(img)
+	if v.Kind() == reflect.Ptr && !v.IsNil() {
+		return v.Pointer(), true
+	}
+	return 0, false
+}
+
 // SignPDF applies the requested signature placements onto the PDF.
+// Identical signature visuals are processed once and embedded as a single shared PDF Image XObject.
 // All operations use stateless pdfcpu configuration and stage writes atomically.
 func SignPDF(ctx context.Context, req SignRequest, progress func(done float64, msg string)) error {
 	if req.InFile == "" || req.OutFile == "" {
@@ -101,6 +120,24 @@ func SignPDF(ctx context.Context, req SignRequest, progress func(done float64, m
 		offsetX  float64
 		offsetY  float64
 	}
+	type renderCacheKey struct {
+		imgPtr  uintptr
+		inkMode InkColorMode
+		crisp   bool
+		crop    NormalizedRect
+		rot10   int
+		op1000  int
+	}
+	type embeddedXObj struct {
+		xobjName string
+		imgRef   *types.IndirectRef
+		imgW     float64
+		imgH     float64
+	}
+
+	byRenderKey := make(map[renderCacheKey]embeddedXObj)
+	byContentHash := make(map[[32]byte]embeddedXObj)
+	nextXObjSeq := 0
 
 	pageStamps := make(map[int][]stampedSig)
 	totalSigs := float64(len(req.Signatures))
@@ -124,13 +161,6 @@ func SignPDF(ctx context.Context, req SignRequest, progress func(done float64, m
 			progress(p, fmt.Sprintf("Rendering signature %d of %d...", i+1, len(req.Signatures)))
 		}
 
-		// 1. Apply ink color if specified
-		procImg := sig.Image
-		if sig.InkMode != InkOriginal {
-			procImg = RecolorSignature(procImg, sig.InkMode)
-		}
-
-		// 2. Render placement with crop, rotation, opacity
 		opacity := sig.Opacity
 		if opacity <= 0 || opacity > 1.0 {
 			opacity = 1.0
@@ -139,47 +169,84 @@ func SignPDF(ctx context.Context, req SignRequest, progress func(done float64, m
 		if crop.W <= 0 || crop.H <= 0 {
 			crop = DefaultNormalizedRect()
 		}
-		if sig.Crisp {
-			procImg = EnhanceSignatureInk(procImg)
+
+		var emb embeddedXObj
+		var hasEmb bool
+		ptr, ptrOK := imageIdentityPtr(sig.Image)
+		var rKey renderCacheKey
+		if ptrOK {
+			rKey = renderCacheKey{
+				imgPtr:  ptr,
+				inkMode: sig.InkMode,
+				crisp:   sig.Crisp,
+				crop:    crop,
+				rot10:   int(math.Round(sig.Rotation * 10)),
+				op1000:  int(math.Round(opacity * 1000)),
+			}
+			emb, hasEmb = byRenderKey[rKey]
 		}
 
-		compImg := RenderPlacementImage(procImg, PlacementRenderOptions{
-			Crop:        crop,
-			RotationDeg: sig.Rotation,
-			Opacity:     opacity,
-		})
+		if !hasEmb {
+			procImg := sig.Image
+			if sig.InkMode != InkOriginal {
+				procImg = RecolorSignature(procImg, sig.InkMode)
+			}
+			if sig.Crisp {
+				procImg = EnhanceSignatureInk(procImg)
+			}
 
-		// 3. Encode composited PNG to buffer
-		var buf bytes.Buffer
-		if err := png.Encode(&buf, compImg); err != nil {
-			return fmt.Errorf("encode placement image: %w", err)
+			compImg := RenderPlacementImage(procImg, PlacementRenderOptions{
+				Crop:        crop,
+				RotationDeg: sig.Rotation,
+				Opacity:     opacity,
+			})
+
+			imgW := float64(compImg.Bounds().Dx())
+			imgH := float64(compImg.Bounds().Dy())
+			if imgW <= 0 || imgH <= 0 {
+				continue
+			}
+
+			var buf bytes.Buffer
+			if err := png.Encode(&buf, compImg); err != nil {
+				return fmt.Errorf("encode placement image: %w", err)
+			}
+			rawPNG := buf.Bytes()
+			sum := sha256.Sum256(rawPNG)
+
+			if existing, ok := byContentHash[sum]; ok {
+				emb = existing
+			} else {
+				imgRef, _, _, err := model.CreateImageResource(pdfCtx.XRefTable, bytes.NewReader(rawPNG))
+				if err != nil {
+					return fmt.Errorf("create image xobject: %w", err)
+				}
+				nextXObjSeq++
+				emb = embeddedXObj{
+					xobjName: fmt.Sprintf("MToolsSig%d", nextXObjSeq),
+					imgRef:   imgRef,
+					imgW:     imgW,
+					imgH:     imgH,
+				}
+				byContentHash[sum] = emb
+			}
+			if ptrOK {
+				byRenderKey[rKey] = emb
+			}
 		}
 
-		// 4. Calculate scale factor and position matching ui.Image Contain fit.
-		imgW := float64(compImg.Bounds().Dx())
-		imgH := float64(compImg.Bounds().Dy())
-		if imgW <= 0 || imgH <= 0 {
-			continue
-		}
-
-		scaleFactor := math.Min(sig.Width/imgW, sig.Height/imgH)
+		scaleFactor := math.Min(sig.Width/emb.imgW, sig.Height/emb.imgH)
 		if scaleFactor <= 0 {
 			continue
 		}
-		drawnW := imgW * scaleFactor
-		drawnH := imgH * scaleFactor
+		drawnW := emb.imgW * scaleFactor
+		drawnH := emb.imgH * scaleFactor
 		offsetX := sig.X + (sig.Width-drawnW)/2
 		offsetY := sig.Y + (sig.Height-drawnH)/2
 
-		// 5. Embed PNG directly as a PDF Image XObject (bypasses pdfcpu watermark DSL/DiagonalLLToUR).
-		imgRef, _, _, err := model.CreateImageResource(pdfCtx.XRefTable, &buf)
-		if err != nil {
-			return fmt.Errorf("create image xobject: %w", err)
-		}
-
 		pageStamps[sig.Page] = append(pageStamps[sig.Page], stampedSig{
-			xobjName: fmt.Sprintf("MToolsSig%d", i+1),
-			imgRef:   imgRef,
+			xobjName: emb.xobjName,
+			imgRef:   emb.imgRef,
 			drawnW:   drawnW,
 			drawnH:   drawnH,
 			offsetX:  offsetX,
@@ -229,7 +296,6 @@ func SignPDF(ctx context.Context, req SignRequest, progress func(done float64, m
 			d.Delete("Rotate")
 		}
 
-		// Attach XObjects to page /Resources
 		resDict := attrs.Resources
 		if resDict == nil {
 			resDict = types.NewDict()
@@ -251,7 +317,6 @@ func SignPDF(ctx context.Context, req SignRequest, progress func(done float64, m
 		resDict.Insert("XObject", xobjDict)
 		d.Update("Resources", resDict)
 
-		// Build explicit zero-rotation PDF CTM commands in visual bottom-left coordinates.
 		var stampBuf bytes.Buffer
 		for _, s := range pageStamps[pageNum] {
 			pdfX := vp.LL.X + s.offsetX
@@ -267,7 +332,6 @@ func SignPDF(ctx context.Context, req SignRequest, progress func(done float64, m
 
 	pdfCtx.EnsureVersionForWriting()
 
-	// 6. Stage write in destination directory
 	outDir := filepath.Dir(req.OutFile)
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
@@ -292,8 +356,7 @@ func SignPDF(ctx context.Context, req SignRequest, progress func(done float64, m
 		progress(0.95, "Finalizing output...")
 	}
 
-	// Atomic rename to target output path
-	if err := os.Rename(tempFile, req.OutFile); err != nil {
+	if err := replaceFileAtomic(tempFile, req.OutFile); err != nil {
 		return fmt.Errorf("finalize signed output: %w", err)
 	}
 

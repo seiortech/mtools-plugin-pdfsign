@@ -3,6 +3,7 @@ package pdfsign
 import (
 	"context"
 	"errors"
+	"image"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -221,5 +222,117 @@ startxref
 
 	if topLuma >= bottomLuma {
 		t.Fatalf("expected top of page to be dark and bottom to be light (page is upside-down!): topLuma=%v, bottomLuma=%v", topLuma, bottomLuma)
+	}
+}
+
+type mockSignBatchRenderer struct {
+	dims       []PageDim
+	allCalls   int
+	countCalls int
+	dimCalls   int
+}
+
+func (m *mockSignBatchRenderer) PageCount(context.Context, string) (int, error) {
+	m.countCalls++
+	return len(m.dims), nil
+}
+
+func (m *mockSignBatchRenderer) PageDimensions(context.Context, string, int) (float64, float64, error) {
+	m.dimCalls++
+	return 200, 300, nil
+}
+
+func (m *mockSignBatchRenderer) RenderPage(context.Context, string, int, float64) (image.Image, error) {
+	return image.NewRGBA(image.Rect(0, 0, 10, 10)), nil
+}
+
+func (m *mockSignBatchRenderer) AllPageDimensions(context.Context, string) ([]PageDim, error) {
+	m.allCalls++
+	return m.dims, nil
+}
+
+func TestAllPageDimensionsSinglePassAndRotated(t *testing.T) {
+	mock := &mockSignBatchRenderer{
+		dims: []PageDim{{Width: 200, Height: 300}, {Width: 300, Height: 200}},
+	}
+	got, err := AllPageDimensions(context.Background(), mock, "/fake.pdf")
+	if err != nil || len(got) != 2 || got[1].Width != 300 {
+		t.Fatalf("AllPageDimensions mock = (%+v, %v)", got, err)
+	}
+	if mock.allCalls != 1 || mock.countCalls != 0 || mock.dimCalls != 0 {
+		t.Fatalf("expected 1 batch call, got all=%d count=%d dim=%d", mock.allCalls, mock.countCalls, mock.dimCalls)
+	}
+
+	tmpDir := t.TempDir()
+	rotPath := filepath.Join(tmpDir, "rot90.pdf")
+	rotatedPDF := strings.Replace(minimalPDF, "/MediaBox [0 0 200 300]", "/MediaBox [0 0 200 300] /Rotate 90", 1)
+	if err := os.WriteFile(rotPath, []byte(rotatedPDF), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	dr := DefaultRenderer()
+	configureTestRenderer(t, dr)
+	dims, err := AllPageDimensions(context.Background(), dr, rotPath)
+	if err != nil || len(dims) != 1 || int(dims[0].Width) != 300 || int(dims[0].Height) != 200 {
+		t.Fatalf("DefaultRenderer AllPageDimensions rotated = (%+v, %v), want 300x200", dims, err)
+	}
+
+	fbDims, err := AllPageDimensions(context.Background(), &FallbackRenderer{}, rotPath)
+	if err != nil || len(fbDims) != 1 || int(fbDims[0].Width) != 300 || int(fbDims[0].Height) != 200 {
+		t.Fatalf("FallbackRenderer AllPageDimensions rotated = (%+v, %v), want 300x200", fbDims, err)
+	}
+}
+
+func TestPageBitmapCacheAndBytesCacheByteBudget(t *testing.T) {
+	bm := NewPageBitmapCacheWithBudget(10, 80_000)
+	bm.Put("/a.pdf", 1, 1.0, image.NewRGBA(image.Rect(0, 0, 100, 100)))
+	bm.Put("/a.pdf", 2, 1.0, image.NewRGBA(image.Rect(0, 0, 100, 100)))
+	bm.Put("/a.pdf", 3, 1.0, image.NewRGBA(image.Rect(0, 0, 100, 100)))
+	if bm.Bytes() > 80_000 {
+		t.Fatalf("bitmap cache exceeded budget: %d", bm.Bytes())
+	}
+	if _, ok := bm.Get("/a.pdf", 1, 1.0); ok {
+		t.Fatal("expected oldest bitmap evicted")
+	}
+
+	bc := NewPageBytesCache(1000)
+	bc.Put("/a.pdf", 1, 1.0, make([]byte, 400))
+	bc.Put("/a.pdf", 2, 1.0, make([]byte, 400))
+	bc.Put("/b.pdf", 1, 1.0, make([]byte, 400))
+	if bc.Bytes() > 1000 {
+		t.Fatalf("bytes cache exceeded budget: %d", bc.Bytes())
+	}
+	if _, ok := bc.Get("/a.pdf", 1, 1.0); ok {
+		t.Fatal("expected oldest byte entry evicted")
+	}
+	bc.ClearForPath("/a.pdf")
+	if bc.Bytes() != 400 {
+		t.Fatalf("expected 400 bytes after ClearForPath, got %d", bc.Bytes())
+	}
+}
+
+func TestAdaptiveRenderScaleAndEmptyPDFSafe(t *testing.T) {
+	if got := computeAdaptiveRenderScale(1.0, 595, 842, defaultRenderMaxDimPx, defaultRenderMaxPixels); got != 2.0 {
+		t.Fatalf("A4 @ 1.0x = %v, want 2.0", got)
+	}
+	if got := computeAdaptiveRenderScale(3.0, 595, 842, defaultRenderMaxDimPx, defaultRenderMaxPixels); got != 3.0 {
+		t.Fatalf("A4 @ 3.0x = %v, want 3.0", got)
+	}
+	posterScale := computeAdaptiveRenderScale(3.0, 2384, 3370, defaultRenderMaxDimPx, defaultRenderMaxPixels)
+	if 2384*posterScale > defaultRenderMaxDimPx+1 || 3370*posterScale > defaultRenderMaxDimPx+1 {
+		t.Fatalf("poster exceeds 4096px at scale=%v", posterScale)
+	}
+
+	emptyPath := filepath.Join(t.TempDir(), "empty.pdf")
+	if err := os.WriteFile(emptyPath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	dr := DefaultRenderer()
+	configureTestRenderer(t, dr)
+	if _, err := dr.PageCount(context.Background(), emptyPath); err == nil {
+		t.Fatal("expected error for 0-byte PDF")
+	}
+	if _, err := dr.RenderPage(context.Background(), emptyPath, 1, 1.0); err == nil {
+		t.Fatal("expected error for 0-byte PDF RenderPage")
 	}
 }

@@ -1,6 +1,7 @@
 package pdfsign
 
 import (
+	"bytes"
 	"context"
 	"image"
 	"image/color"
@@ -8,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 func createSolidTestImage(w, h int, c color.Color) image.Image {
@@ -383,5 +387,71 @@ func TestSignPDFRotatedPageWYSIWYG(t *testing.T) {
 	if abs(gotX-40) > tol || abs(gotY-30) > tol || abs(gotW-80) > tol || abs(gotH-40) > tol {
 		t.Errorf("rotated-page sig mismatch: got (x=%.1f, y=%.1f, w=%.1f, h=%.1f), want (40, 30, 80, 40)",
 			gotX, gotY, gotW, gotH)
+	}
+}
+
+func TestSignPDFDeduplicatesXObjects(t *testing.T) {
+	tmpDir := t.TempDir()
+	single := filepath.Join(tmpDir, "one.pdf")
+	if err := os.WriteFile(single, []byte(minimalPDF), 0644); err != nil {
+		t.Fatal(err)
+	}
+	inputs := make([]string, 20)
+	for i := range inputs {
+		inputs[i] = single
+	}
+	multiPDF := filepath.Join(tmpDir, "twenty.pdf")
+	if err := api.MergeCreateFile(context.Background(), inputs, multiPDF, false, model.NewStatelessConfiguration()); err != nil {
+		t.Fatalf("MergeCreateFile: %v", err)
+	}
+
+	// Non-uniform 200x100 signature image so PNG stream is non-trivial (~30-60 KB).
+	sigImg := image.NewNRGBA(image.Rect(0, 0, 200, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 200; x++ {
+			sigImg.SetNRGBA(x, y, color.NRGBA{
+				R: uint8((x*7 + y*13) % 256),
+				G: uint8((x*11 + y*5) % 256),
+				B: uint8((x*3 + y*17) % 256),
+				A: 220,
+			})
+		}
+	}
+
+	placements := make([]PlacedSignature, 20)
+	for i := range placements {
+		placements[i] = PlacedSignature{
+			ID:       "sig",
+			Page:     i + 1,
+			X:        20,
+			Y:        30,
+			Width:    80,
+			Height:   40,
+			Opacity:  1.0,
+			Rotation: 0,
+			Crop:     DefaultNormalizedRect(),
+			InkMode:  InkOriginal,
+			Image:    sigImg,
+		}
+	}
+
+	outPDF := filepath.Join(tmpDir, "signed_twenty.pdf")
+	if err := SignPDF(context.Background(), SignRequest{
+		InFile:     multiPDF,
+		OutFile:    outPDF,
+		Signatures: placements,
+	}, nil); err != nil {
+		t.Fatalf("SignPDF 20 pages: %v", err)
+	}
+
+	raw, err := os.ReadFile(outPDF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte("MToolsSig1")) {
+		t.Fatal("expected /MToolsSig1 XObject in signed PDF")
+	}
+	if bytes.Contains(raw, []byte("MToolsSig2")) {
+		t.Fatal("expected identical signatures across 20 pages to share a single XObject (/MToolsSig1), found /MToolsSig2")
 	}
 }
